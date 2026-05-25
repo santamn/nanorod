@@ -1,0 +1,72 @@
+{
+  "name": "nanorod",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "workspaceFolder": "/workspace",
+  "mounts": [
+    {
+      "source": "${localWorkspaceFolder}",
+      "target": "/workspace",
+      "type": "bind"
+    },
+    {
+      "source": "nanorod-cargo-registry",
+      "target": "/usr/local/cargo/registry",
+      "type": "volume"
+    },
+    {
+      "source": "nanorod-cargo-git",
+      "target": "/usr/local/cargo/git",
+      "type": "volume"
+    },
+    {
+      "source": "nanorod-target",
+      "target": "${containerWorkspaceFolder}/target",
+      "type": "volume"
+    },
+    {
+      "source": "${env:SSH_AUTH_SOCK}",
+      "target": "/ssh-agent",
+      "type": "bind"
+    }
+  ],
+  "features": {
+    "ghcr.io/devcontainers/features/common-utils:2": {
+      "configureZshAsDefaultShell": "true",
+      "username": "miyake"
+    },
+    "ghcr.io/devcontainers/features/rust:1": {
+      "version": "1.95.0"
+    },
+    "ghcr.io/devcontainers/features/nvidia-cuda:3": {
+      "installCudnn": true,
+      "installToolkit": true,
+      "installCudnnDev": true,
+      "cudaVersion": "12.6"
+    },
+    "ghcr.io/devcontainers-extra/features/apt-packages:1": {
+      "packages": "build-essential, clang, mold, gnuplot, ripgrep"
+    }
+  },
+  "runArgs": ["--device=nvidia.com/gpu=3", "--memory=60gb"],
+  "containerUser": "miyake",
+  "postCreateCommand": "cargo fetch",
+  "containerEnv": {
+    "CARGO_TERM_COLOR": "always",
+    "SSH_AUTH_SOCK": "/ssh-agent"
+  },
+  "remoteEnv": {
+    "PATH": "/usr/local/cuda/bin:${containerEnv:PATH}",
+    "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:${containerEnv:LD_LIBRARY_PATH}"
+  },
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "ms-vscode.cpptools",
+        "rust-lang.rust-analyzer",
+        "vadimcn.vscode-lldb",
+        "tamasfe.even-better-toml",
+        "NVIDIA.nsight-vscode-edition"
+      ]
+    }
+  }
+}
