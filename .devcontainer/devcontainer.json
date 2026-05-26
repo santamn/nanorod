@@ -44,10 +44,15 @@
       "cudaVersion": "12.6"
     },
     "ghcr.io/devcontainers-extra/features/apt-packages:1": {
-      "packages": "build-essential, clang, mold, gnuplot, ripgrep"
+      "packages": "build-essential, clang, mold, gnuplot, poppler-utils, ripgrep"
     }
   },
-  "runArgs": ["--device=nvidia.com/gpu=3", "--memory=60gb"],
+  "runArgs": [
+    "--device=nvidia.com/gpu=1",
+    "--device=nvidia.com/gpu=2",
+    "--device=nvidia.com/gpu=3", 
+    "--memory=60gb"
+  ],
   "containerUser": "miyake",
   "postCreateCommand": "cargo fetch",
   "containerEnv": {
@@ -65,7 +70,8 @@
         "rust-lang.rust-analyzer",
         "vadimcn.vscode-lldb",
         "tamasfe.even-better-toml",
-        "NVIDIA.nsight-vscode-edition"
+        "NVIDIA.nsight-vscode-edition",
+        "anthropic.claude-code"
       ]
     }
   }
