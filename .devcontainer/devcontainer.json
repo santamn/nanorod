@@ -35,16 +35,16 @@
       "username": "miyake"
     },
     "ghcr.io/devcontainers/features/rust:1": {
-      "version": "1.95.0"
+      "version": "1.96.0"
     },
     "ghcr.io/devcontainers/features/nvidia-cuda:3": {
       "installCudnn": true,
       "installToolkit": true,
       "installCudnnDev": true,
-      "cudaVersion": "12.6"
+      "cudaVersion": "12.2"
     },
     "ghcr.io/devcontainers-extra/features/apt-packages:1": {
-      "packages": "build-essential, clang, mold, gnuplot, poppler-utils, ripgrep"
+      "packages": "build-essential, clang, mold, gnuplot, poppler-utils, ripgrep, fd"
     }
   },
   "runArgs": [
@@ -71,7 +71,8 @@
         "vadimcn.vscode-lldb",
         "tamasfe.even-better-toml",
         "NVIDIA.nsight-vscode-edition",
-        "anthropic.claude-code"
+        "anthropic.claude-code",
+        "openai.chatgpt"
       ]
     }
   }
