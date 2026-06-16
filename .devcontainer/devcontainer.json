@@ -1,7 +1,8 @@
 {
   "name": "nanorod",
-  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
   "workspaceFolder": "/workspace",
+  "shutdownAction": "none",
   "mounts": [
     {
       "source": "${localWorkspaceFolder}",
@@ -44,7 +45,7 @@
       "cudaVersion": "12.2"
     },
     "ghcr.io/devcontainers-extra/features/apt-packages:1": {
-      "packages": "build-essential, clang, mold, gnuplot, poppler-utils, ripgrep, fd"
+      "packages": "build-essential, clang, mold, gnuplot, poppler-utils, ripgrep, fd-find, tmux"
     }
   },
   "runArgs": [
@@ -73,7 +74,10 @@
         "NVIDIA.nsight-vscode-edition",
         "anthropic.claude-code",
         "openai.chatgpt"
-      ]
+      ],
+      "settings": {
+        "terminal.integrated.persistentSessionReviveProcess": "never"
+      }
     }
   }
 }
