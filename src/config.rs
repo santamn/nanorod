@@ -63,6 +63,9 @@ pub struct Cli {
     #[arg(long)]
     pub combo_limit: Option<usize>,
 
+    #[arg(long, default_value_t = 0)]
+    pub combo_start: usize,
+
     #[arg(long, default_value_t = DEFAULT_MAX_STEPS)]
     pub max_steps: u64,
 
@@ -129,6 +132,30 @@ pub fn all_parameter_combinations() -> Vec<SimParams> {
     combos
 }
 
+/// production run で処理するパラメータ組み合わせだけを取り出す。
+pub fn production_parameter_combinations(
+    combo_start: usize,
+    combo_limit: Option<usize>,
+) -> anyhow::Result<Vec<SimParams>> {
+    let mut combos = all_parameter_combinations();
+    if let Some(limit) = combo_limit {
+        combos.truncate(limit);
+    }
+
+    anyhow::ensure!(
+        combo_start < combos.len(),
+        "--combo-start {} leaves no parameter combinations to run after applying --combo-limit ({} combo(s) selected)",
+        combo_start,
+        combos.len()
+    );
+
+    if combo_start > 0 {
+        combos.drain(..combo_start);
+    }
+
+    Ok(combos)
+}
+
 /// architecture.md の制約に従い、GPU 0 を誤って使わないように検証する。
 pub fn validate_devices(devices: &[usize], allow_device_zero: bool) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -170,5 +197,24 @@ mod tests {
             assert_eq!(2 * m + 1, points);
             assert_eq!(particle_length(m), 2.0 * f64::from(m) * 0.8 * SIGMA);
         }
+    }
+
+    #[test]
+    fn production_range_keeps_original_combo_ids() {
+        let combos = production_parameter_combinations(495, Some(684)).unwrap();
+        assert_eq!(combos.first().unwrap().combo_id, 495);
+        assert_eq!(combos.last().unwrap().combo_id, 683);
+        assert!(combos.iter().all(|params| params.m == 1));
+        assert_eq!(combos.len(), 189);
+    }
+
+    #[test]
+    fn production_range_rejects_empty_selection() {
+        let error = production_parameter_combinations(684, Some(684)).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("leaves no parameter combinations")
+        );
     }
 }

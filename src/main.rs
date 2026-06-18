@@ -3,8 +3,9 @@ mod gpu;
 mod model;
 
 use std::collections::VecDeque;
-use std::fs::{File, create_dir_all};
+use std::fs::{File, create_dir, create_dir_all};
 use std::io::{BufWriter, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -12,7 +13,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
-use config::{Cli, RunMode, SimParams, all_parameter_combinations, validate_devices};
+use config::{
+    Cli, RunMode, SimParams, all_parameter_combinations, production_parameter_combinations,
+    validate_devices,
+};
 use gpu::{ComboOutput, ComboWork, GpuProgress, GpuRunConfig};
 use model::{ProgressRow, SummaryRow, aggregate_summaries};
 
@@ -28,8 +32,6 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     model::validate_static_geometry()?;
     validate_devices(&cli.devices, cli.allow_device_zero)?;
-    create_dir_all(&cli.output_dir)
-        .with_context(|| format!("failed to create {}", cli.output_dir.display()))?;
 
     let include_paths = gpu::cuda_include_paths(&cli.cuda_include_path);
     let trial_count = gpu::trial_count_for_mode(cli.mode, cli.trials);
@@ -47,6 +49,26 @@ fn main() -> Result<()> {
     }
 }
 
+fn create_new_output_dir(path: &Path) -> Result<()> {
+    if path.exists() {
+        anyhow::bail!(
+            "refusing to write to existing output directory {}; choose a new --output-dir to avoid overwriting records",
+            path.display()
+        );
+    }
+
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        create_dir_all(parent)
+            .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
+    }
+
+    create_dir(path).with_context(|| format!("failed to create {}", path.display()))?;
+    Ok(())
+}
+
 /// 1つのパラメータ組み合わせを少数 trial で確認する。
 ///
 /// trial 詳細を出力し、GPU 1,2,3 へ trial を分割して multi-GPU 経路も確認する。
@@ -56,6 +78,7 @@ fn run_smoke(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> Resul
         .get(cli.smoke_combo_id)
         .with_context(|| format!("smoke combo id {} is out of range", cli.smoke_combo_id))?;
     let splits = split_trials(trial_count, cli.devices.len());
+    create_new_output_dir(&cli.output_dir)?;
 
     let smoke_trials_path = cli.output_dir.join("smoke_trials.csv");
     let smoke_summary_path = cli.output_dir.join("smoke_summary.json");
@@ -152,13 +175,9 @@ fn run_smoke(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> Resul
 ///
 /// trial 詳細は保存せず、combo ごとの summary だけを逐次 flush する。
 fn run_production(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> Result<()> {
-    let mut combos = all_parameter_combinations();
-    if let Some(limit) = cli.combo_limit {
-        combos.truncate(limit);
-    }
-
+    let combos = production_parameter_combinations(cli.combo_start, cli.combo_limit)?;
     let total_combos = combos.len();
-    anyhow::ensure!(total_combos > 0, "no parameter combinations to run");
+    create_new_output_dir(&cli.output_dir)?;
 
     let summary_path = cli.output_dir.join("summary.json");
     let progress_path = cli.output_dir.join("progress.jsonl");
