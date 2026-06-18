@@ -55,16 +55,10 @@
     "--memory=60gb"
   ],
   "containerUser": "miyake",
-  "postCreateCommand": "cargo fetch",
+  "postCreateCommand": "echo 'export PATH=\"/usr/local/cuda/bin:$PATH\"' >> ~/.zshrc && echo 'export LD_LIBRARY_PATH=\"/usr/local/cuda/lib64:$LD_LIBRARY_PATH\"' >> ~/.zshrc && echo 'export PATH=\"/usr/local/cuda/bin:$PATH\"' >> ~/.bashrc && echo 'export LD_LIBRARY_PATH=\"/usr/local/cuda/lib64:$LD_LIBRARY_PATH\"' >> ~/.bashrc && cargo fetch",
   "containerEnv": {
     "CARGO_TERM_COLOR": "always",
-    "SSH_AUTH_SOCK": "/ssh-agent",
-    "PATH": "/usr/local/cuda/bin:${containerEnv:PATH}",
-    "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:${containerEnv:LD_LIBRARY_PATH}"
-  },
-  "remoteEnv": {
-    "PATH": "/usr/local/cuda/bin:${containerEnv:PATH}",
-    "LD_LIBRARY_PATH": "/usr/local/cuda/lib64:${containerEnv:LD_LIBRARY_PATH}"
+    "SSH_AUTH_SOCK": "/ssh-agent"
   },
   "customizations": {
     "vscode": {
