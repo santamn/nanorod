@@ -12,8 +12,8 @@ pub const PARTICLE_DX: f64 = 0.8 * SIGMA;
 pub const N_WALL: usize = (L_PERIOD / WALL_DX) as usize;
 pub const WALL_K: i32 = 5;
 pub const RNG_STATE_BYTES: usize = 256;
-pub const DEFAULT_MAX_STEPS: u64 = 25_000_000;
-pub const DEFAULT_PRODUCTION_TRIALS: usize = 30_000;
+pub const DEFAULT_MAX_STEPS: u64 = 250_000_000; // 2.5 × 10^8
+pub const DEFAULT_PRODUCTION_TRIALS: usize = 1000;
 pub const DEFAULT_SMOKE_TRIALS: usize = 96;
 
 // rod_simulation.md にある全パラメータ掃引の値。
