@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{path::Path, sync::Arc, time::Instant};
 
 #[allow(dead_code)]
 #[path = "../config.rs"]
@@ -11,7 +11,9 @@ mod model;
 
 use cpu_sim::{VisualParams, VisualSimulation};
 use eframe::egui;
-use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
+use egui::{
+    Color32, FontData, FontDefinitions, FontFamily, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2,
+};
 
 const TRAIL_LIMIT: usize = 900;
 
@@ -43,6 +45,7 @@ struct AnimationApp {
 
 impl AnimationApp {
     fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        install_system_japanese_font(&cc.egui_ctx);
         configure_style(&cc.egui_ctx);
 
         let controls = VisualParams::default();
@@ -149,35 +152,33 @@ impl eframe::App for AnimationApp {
 
                 ui.separator();
 
-                let mut changed = false;
+                let mut params_changed = false;
                 let point_count_label = point_count_label(self.controls.m);
-                changed |= ui
+                params_changed |= ui
                     .add(
                         egui::DragValue::new(&mut self.controls.seed)
                             .speed(1.0)
                             .prefix("seed "),
                     )
                     .changed();
-                changed |= ui
+                params_changed |= ui
                     .add(egui::Slider::new(&mut self.controls.m, 1..=30).text(point_count_label))
                     .changed();
-                changed |= ui
+                params_changed |= ui
                     .add(egui::Slider::new(&mut self.controls.force, 0.0..=100.0).text("f"))
                     .changed();
-                changed |= ui
+                params_changed |= ui
                     .add(egui::Slider::new(&mut self.controls.beta_pe, -5.0..=5.0).text("βpE"))
                     .changed();
-                changed |= ui
+                params_changed |= ui
                     .add(
                         egui::Slider::new(&mut self.controls.delta_alpha_e_over_p, -5.0..=5.0)
                             .text("ΔαE/p"),
                     )
                     .changed();
-                changed |= ui
-                    .add(egui::Slider::new(&mut self.speed_scale, 0.01..=2.0).text("速度"))
-                    .changed();
+                ui.add(egui::Slider::new(&mut self.speed_scale, 0.01..=2.0).text("速度"));
 
-                if changed {
+                if params_changed {
                     self.running = false;
                     self.reset();
                 }
@@ -190,7 +191,7 @@ impl eframe::App for AnimationApp {
                 ui.label(format!("φ0 {:.3}", self.simulation.phi0));
                 ui.label(format!("x {:.4}", self.simulation.x));
                 ui.label(format!("y {:.4}", self.simulation.y));
-                ui.label(format!("φ {:.3}", self.simulation.phi));
+                ui.label(format!("φ {:.3}", display_angle(self.simulation.phi)));
                 ui.label(if self.simulation.completed {
                     "初通過 済"
                 } else {
@@ -201,9 +202,39 @@ impl eframe::App for AnimationApp {
         egui::CentralPanel::default().show_inside(ui, |ui| {
             let available = ui.available_size();
             let (response, painter) = ui.allocate_painter(available, Sense::hover());
+            let painter = painter.with_clip_rect(response.rect);
             draw_simulation(&painter, response.rect, &self.simulation, &self.trail);
         });
     }
+}
+
+fn install_system_japanese_font(ctx: &egui::Context) {
+    let Some((name, data)) = load_first_existing_font(JAPANESE_FONT_CANDIDATES) else {
+        return;
+    };
+
+    let mut fonts = FontDefinitions::default();
+    fonts
+        .font_data
+        .insert(name.clone(), Arc::new(FontData::from_owned(data)));
+
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        fonts.families.entry(family).or_default().push(name.clone());
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+fn load_first_existing_font(paths: &[&str]) -> Option<(String, Vec<u8>)> {
+    paths.iter().find_map(|path| {
+        let bytes = std::fs::read(path).ok()?;
+        let name = Path::new(path)
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("system_japanese")
+            .to_owned();
+        Some((name, bytes))
+    })
 }
 
 fn configure_style(ctx: &egui::Context) {
@@ -223,6 +254,10 @@ fn point_count_label(m: i32) -> String {
     format!("代表点 {}", 2 * m + 1)
 }
 
+fn display_angle(phi: f64) -> f64 {
+    phi.rem_euclid(std::f64::consts::TAU)
+}
+
 fn draw_simulation(
     painter: &egui::Painter,
     rect: Rect,
@@ -231,8 +266,9 @@ fn draw_simulation(
 ) {
     painter.rect_filled(rect, 0.0, Color32::from_rgb(239, 244, 243));
 
-    let camera_x = simulation.x + 0.34;
-    let world = WorldView::new(rect, camera_x, 2.35, 5.4);
+    let camera_x = simulation.x;
+    let camera_y = simulation.y.clamp(-0.7, 0.7);
+    let world = WorldView::new(rect, camera_x, camera_y, 5.25);
 
     draw_channel(painter, &world);
     draw_markers(painter, &world, simulation);
@@ -243,7 +279,7 @@ fn draw_simulation(
 fn draw_channel(painter: &egui::Painter, world: &WorldView) {
     let mut top = Vec::with_capacity(260);
     let mut bottom = Vec::with_capacity(260);
-    let samples = 240;
+    let samples = ((world.x_max - world.x_min) * 160.0).ceil() as usize;
 
     for idx in 0..=samples {
         let x = world.x_min + (world.x_max - world.x_min) * idx as f64 / samples as f64;
@@ -262,8 +298,9 @@ fn draw_channel(painter: &egui::Painter, world: &WorldView) {
     ));
 
     let mut centerline = Vec::with_capacity(80);
-    for idx in 0..=80 {
-        let x = world.x_min + (world.x_max - world.x_min) * idx as f64 / 80.0;
+    let centerline_samples = ((world.x_max - world.x_min) * 40.0).ceil() as usize;
+    for idx in 0..=centerline_samples {
+        let x = world.x_min + (world.x_max - world.x_min) * idx as f64 / centerline_samples as f64;
         centerline.push(world.to_screen(x, 0.0));
     }
     painter.add(Shape::line(
@@ -274,8 +311,8 @@ fn draw_channel(painter: &egui::Painter, world: &WorldView) {
     for period in (world.x_min.floor() as i32 - 1)..=(world.x_max.ceil() as i32 + 1) {
         let x = f64::from(period);
         if x >= world.x_min && x <= world.x_max {
-            let a = world.to_screen(x, -2.5);
-            let b = world.to_screen(x, 2.5);
+            let a = world.to_screen(x, world.y_min);
+            let b = world.to_screen(x, world.y_max);
             painter.line_segment(
                 [a, b],
                 Stroke::new(1.0, Color32::from_rgba_premultiplied(94, 115, 120, 55)),
@@ -285,15 +322,15 @@ fn draw_channel(painter: &egui::Painter, world: &WorldView) {
 }
 
 fn draw_markers(painter: &egui::Painter, world: &WorldView, simulation: &VisualSimulation) {
-    let start_a = world.to_screen(simulation.x0, -2.5);
-    let start_b = world.to_screen(simulation.x0, 2.5);
+    let start_a = world.to_screen(simulation.x0, world.y_min);
+    let start_b = world.to_screen(simulation.x0, world.y_max);
     painter.line_segment(
         [start_a, start_b],
         Stroke::new(1.5, Color32::from_rgba_premultiplied(65, 93, 167, 110)),
     );
 
-    let target_a = world.to_screen(simulation.target_x, -2.5);
-    let target_b = world.to_screen(simulation.target_x, 2.5);
+    let target_a = world.to_screen(simulation.target_x, world.y_min);
+    let target_b = world.to_screen(simulation.target_x, world.y_max);
     painter.line_segment(
         [target_a, target_b],
         Stroke::new(2.0, Color32::from_rgba_premultiplied(199, 80, 57, 165)),
@@ -350,17 +387,21 @@ struct WorldView {
     x_min: f64,
     x_max: f64,
     y_min: f64,
+    y_max: f64,
     scale: f64,
     origin: Pos2,
 }
 
 impl WorldView {
-    fn new(rect: Rect, center_x: f64, x_span: f64, y_span: f64) -> Self {
+    fn new(rect: Rect, center_x: f64, center_y: f64, y_span: f64) -> Self {
+        let pad = 14.0;
+        let drawable = rect.shrink(pad);
+        let aspect = (drawable.width() / drawable.height().max(1.0)).max(1.0) as f64;
+        let x_span = y_span * aspect;
         let x_min = center_x - 0.5 * x_span;
         let x_max = center_x + 0.5 * x_span;
-        let y_min = -0.5 * y_span;
-        let pad = 26.0;
-        let drawable = rect.shrink(pad);
+        let y_min = center_y - 0.5 * y_span;
+        let y_max = center_y + 0.5 * y_span;
         let scale_x = drawable.width() as f64 / x_span;
         let scale_y = drawable.height() as f64 / y_span;
         let scale = scale_x.min(scale_y);
@@ -375,6 +416,7 @@ impl WorldView {
             x_min,
             x_max,
             y_min,
+            y_max,
             scale,
             origin,
         }
@@ -386,3 +428,18 @@ impl WorldView {
         pos2(sx, sy)
     }
 }
+
+const JAPANESE_FONT_CANDIDATES: &[&str] = &[
+    "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
+    "/System/Library/Fonts/Supplemental/ヒラギノ角ゴシック W3.ttc",
+    "/System/Library/Fonts/Hiragino Sans GB.ttc",
+    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+    "/Library/Fonts/Arial Unicode.ttf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKjp-Regular.otf",
+    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+    "/usr/share/fonts/opentype/ipafont-gothic/ipag.ttf",
+    "C:\\Windows\\Fonts\\meiryo.ttc",
+    "C:\\Windows\\Fonts\\YuGothM.ttc",
+];

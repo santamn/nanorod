@@ -3,6 +3,8 @@ use std::f64::consts::PI;
 use crate::config::{DT, EPSILON, PARTICLE_DX, SIGMA, SimParams, WALL_DX, WALL_K, particle_length};
 use crate::model::{Diffusion, diffusion_for_length, omega, wall_y_samples};
 
+const MAX_VISUAL_WCA_COEFF: f64 = 2.5e6;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisualParams {
     pub seed: u64,
@@ -219,7 +221,8 @@ fn add_wca_force(
         let sigma2 = SIGMA * SIGMA;
         let s2 = sigma2 / r2;
         let s6 = s2 * s2 * s2;
-        let coeff = 24.0 * EPSILON / r2 * s6 * (2.0 * s6 - 1.0);
+        let coeff = (24.0 * EPSILON / r2 * s6 * (2.0 * s6 - 1.0))
+            .clamp(-MAX_VISUAL_WCA_COEFF, MAX_VISUAL_WCA_COEFF);
         *force_x += coeff * dx;
         *force_y += coeff * dy;
     }
@@ -294,6 +297,18 @@ mod tests {
         assert!(sim.y.is_finite());
         assert!(sim.phi.is_finite());
         assert_eq!(sim.steps, 128);
+    }
+
+    #[test]
+    fn visual_simulation_stays_bounded_during_short_animation_run() {
+        let mut sim = VisualSimulation::new(VisualParams::default());
+        sim.step_many(50_000);
+
+        assert!(sim.x.is_finite());
+        assert!(sim.y.is_finite());
+        assert!(sim.phi.is_finite());
+        assert!(sim.x.abs() < 10.0);
+        assert!(sim.y.abs() < 10.0);
     }
 
     #[test]
