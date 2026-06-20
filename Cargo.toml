@@ -3,6 +3,15 @@ name = "nanorod"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+gpu = ["dep:cudarc"]
+
+[[bin]]
+name = "nanorod"
+path = "src/main.rs"
+required-features = ["gpu"]
+
 [dependencies]
 anyhow = "1.0"
 clap = { version = "4.6.1", features = ["derive"] }
@@ -13,7 +22,7 @@ cudarc = { version = "0.19.7", default-features = false, features = [
   "nvrtc",
   "dynamic-loading",
   "cuda-12020",
-] }
+], optional = true }
 eframe = { version = "0.34.3", default-features = false, features = [
   "default_fonts",
   "glow",
