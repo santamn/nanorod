@@ -1,5 +1,5 @@
 #include <curand_kernel.h>
-#include <cuda_runtime.h>
+#include <math_constants.h>
 
 // Rust側ではcuRAND stateの具体サイズを直接知らないため、trialごとに256 bytesを確保する。
 static_assert(
@@ -45,7 +45,7 @@ __device__ curandStatePhilox4_32_10_t *rng_state_at(
 __device__ double omega(double x)
 {
   double s, c;
-  sincospi(2.0f * x, &s, &c);
+  sincospi(2.0 * x, &s, &c);
   return s + 0.5 * s * c + 1.12;
 }
 
@@ -148,7 +148,7 @@ extern "C" __global__ void init_trials_kernel(
   double y_min = -width + half_l;
   double y_max = width - half_l;
   double y0 = (y_max > y_min) ? (y_min + (y_max - y_min) * uy) : 0.0;
-  double phi0 = 6.283185307179586476925286766559 * uphi;
+  double phi0 = 2.0 * CUDART_PI * uphi;
 
   x0_out[i] = x0;
   y0_out[i] = y0;
@@ -251,16 +251,16 @@ extern "C" __global__ void simulate_kernel(
     double drift_y = (dxy * total_force_x + dyy * total_force_y) * params.dt;
 
     // 並進に2個、回転に1個の標準正規乱数を使う。
-    double2 normal_a = curand_normal2_double(state);
-    double2 normal_b = curand_normal2_double(state);
+    double2 normal_t = curand_normal2_double(state);
+    double normal_r = curand_normal_double(state);
 
-    double noise_body_x = sqrt(2.0 * params.d_parallel * params.dt) * normal_a.x;
-    double noise_body_y = sqrt(2.0 * params.d_perp * params.dt) * normal_a.y;
+    double noise_body_x = sqrt(2.0 * params.d_parallel * params.dt) * normal_t.x;
+    double noise_body_y = sqrt(2.0 * params.d_perp * params.dt) * normal_t.y;
     double noise_x = c * noise_body_x - s * noise_body_y;
     double noise_y = s * noise_body_x + c * noise_body_y;
 
     double tau_e = params.beta_pe * c * (1.0 + params.delta_alpha_e_over_p * s);
-    double dphi = params.d_r * (torque_sum + tau_e) * params.dt + sqrt(2.0 * params.d_r * params.dt) * normal_b.x;
+    double dphi = params.d_r * (torque_sum + tau_e) * params.dt + sqrt(2.0 * params.d_r * params.dt) * normal_r;
 
     // Euler-Maruyamaで1ステップ進める。phiは毎step正規化しない。
     xi += drift_x + noise_x;
