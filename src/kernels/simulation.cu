@@ -30,6 +30,14 @@ struct KernelParams
   double rc2;
 };
 
+// 並進力と角度方向トルクをまとめ、予測点と修正点で同じ力計算を使い回す。
+struct GeneralizedForce
+{
+  double force_x;
+  double force_y;
+  double torque;
+};
+
 // byte buffer上に確保したcuRAND state領域から、trial i のstateポインタを取り出す。
 __device__ curandStatePhilox4_32_10_t *rng_state_at(
     unsigned char *rng_states,
@@ -88,6 +96,58 @@ __device__ void add_wca_force(
     *force_x += coeff * dx;
     *force_y += coeff * dy;
   }
+}
+
+// 指定された棒状態で、壁反発・外力・電場トルクを合成した一般化力を返す。
+__device__ GeneralizedForce generalized_force_at(
+    double xi,
+    double yi,
+    double phii,
+    const double *wall_y,
+    const KernelParams params)
+{
+  double s, c;
+  sincos(phii, &s, &c);
+  double rep_sum_x = 0.0;
+  double rep_sum_y = 0.0;
+  double torque_sum = 0.0;
+
+  // 棒上の 2m+1 個の代表点について、近傍壁点からの反発力を合計する。
+  for (int j = -params.m; j <= params.m; ++j)
+  {
+    double offset = static_cast<double>(j) * params.particle_dx;
+    double rep_x = xi + offset * c;
+    double rep_y = yi + offset * s;
+    double force_x = 0.0;
+    double force_y = 0.0;
+    long long k0 = round_to_ll(rep_x / params.wall_dx);
+
+    // 壁点はx方向インデックスだけで近傍を絞る。上下壁を同時に評価する。
+    for (int q = -params.wall_k; q <= params.wall_k; ++q)
+    {
+      long long k = k0 + static_cast<long long>(q);
+      int k_mod = positive_mod_ll(k, params.n_wall);
+      double wall_x = static_cast<double>(k) * params.wall_dx;
+      double upper_y = wall_y[k_mod];
+
+      add_wca_force(rep_x, rep_y, wall_x, upper_y, params, &force_x, &force_y);
+      add_wca_force(rep_x, rep_y, wall_x, -upper_y, params, &force_x, &force_y);
+    }
+
+    rep_sum_x += force_x;
+    rep_sum_y += force_y;
+    // 2次元外積 n x (offset * f_rep) が壁反発由来のトルクになる。
+    torque_sum += offset * (c * force_y - s * force_x);
+  }
+
+  double inv_points = 1.0 / static_cast<double>(params.point_count);
+  double tau_e = params.beta_pe * c * (1.0 + params.delta_alpha_e_over_p * s);
+
+  GeneralizedForce result;
+  result.force_x = params.force + rep_sum_x * inv_points;
+  result.force_y = rep_sum_y * inv_points;
+  result.torque = torque_sum + tau_e;
+  return result;
 }
 
 // 各trialに独立したPhilox系cuRAND stateを初期化する。
@@ -203,42 +263,7 @@ extern "C" __global__ void simulate_kernel(
 
     double s, c;
     sincos(phii, &s, &c);
-    double rep_sum_x = 0.0;
-    double rep_sum_y = 0.0;
-    double torque_sum = 0.0;
-
-    // 棒上の 2m+1 個の代表点について、近傍壁点からの反発力を合計する。
-    for (int j = -params.m; j <= params.m; ++j)
-    {
-      double offset = static_cast<double>(j) * params.particle_dx;
-      double rep_x = xi + offset * c;
-      double rep_y = yi + offset * s;
-      double force_x = 0.0;
-      double force_y = 0.0;
-      long long k0 = round_to_ll(rep_x / params.wall_dx);
-
-      // 壁点はx方向インデックスだけで近傍を絞る。上下壁を同時に評価する。
-      for (int q = -params.wall_k; q <= params.wall_k; ++q)
-      {
-        long long k = k0 + static_cast<long long>(q);
-        int k_mod = positive_mod_ll(k, params.n_wall);
-        double wall_x = static_cast<double>(k) * params.wall_dx;
-        double upper_y = wall_y[k_mod];
-
-        add_wca_force(rep_x, rep_y, wall_x, upper_y, params, &force_x, &force_y);
-        add_wca_force(rep_x, rep_y, wall_x, -upper_y, params, &force_x, &force_y);
-      }
-
-      rep_sum_x += force_x;
-      rep_sum_y += force_y;
-      // 2次元外積 n x (offset * f_rep) が壁反発由来のトルクになる。
-      torque_sum += offset * (c * force_y - s * force_x);
-    }
-
-    // 外力は各代表点に同じだけ働くため、平均後も (f, 0) として残る。
-    double inv_points = 1.0 / static_cast<double>(params.point_count);
-    double total_force_x = params.force + rep_sum_x * inv_points;
-    double total_force_y = rep_sum_y * inv_points;
+    GeneralizedForce predictor_force = generalized_force_at(xi, yi, phii, wall_y, params);
 
     double cos2, sin2;
     sincos(2.0 * phii, &sin2, &cos2);
@@ -246,9 +271,6 @@ extern "C" __global__ void simulate_kernel(
     double dxx = d_scale * (3.0 + cos2);
     double dxy = d_scale * sin2;
     double dyy = d_scale * (3.0 - cos2);
-
-    double drift_x = (dxx * total_force_x + dxy * total_force_y) * params.dt;
-    double drift_y = (dxy * total_force_x + dyy * total_force_y) * params.dt;
 
     // 並進に2個、回転に1個の標準正規乱数を使う。
     double2 normal_t = curand_normal2_double(state);
@@ -258,14 +280,31 @@ extern "C" __global__ void simulate_kernel(
     double noise_body_y = sqrt(2.0 * params.d_perp * params.dt) * normal_t.y;
     double noise_x = c * noise_body_x - s * noise_body_y;
     double noise_y = s * noise_body_x + c * noise_body_y;
+    double noise_phi = sqrt(2.0 * params.d_r * params.dt) * normal_r;
 
-    double tau_e = params.beta_pe * c * (1.0 + params.delta_alpha_e_over_p * s);
-    double dphi = params.d_r * (torque_sum + tau_e) * params.dt + sqrt(2.0 * params.d_r * params.dt) * normal_r;
+    double predictor_drift_x =
+        (dxx * predictor_force.force_x + dxy * predictor_force.force_y) * params.dt;
+    double predictor_drift_y =
+        (dxy * predictor_force.force_x + dyy * predictor_force.force_y) * params.dt;
+    double predictor_dphi = params.d_r * predictor_force.torque * params.dt + noise_phi;
 
-    // Euler-Maruyamaで1ステップ進める。phiは毎step正規化しない。
-    xi += drift_x + noise_x;
-    yi += drift_y + noise_y;
-    phii += dphi;
+    double predicted_x = xi + predictor_drift_x + noise_x;
+    double predicted_y = yi + predictor_drift_y + noise_y;
+    double predicted_phi = phii + predictor_dphi;
+
+    // 拡散係数は予測点で再評価せず、論文の修正子段階に相当する力だけを後点で評価する。
+    GeneralizedForce corrector_force =
+        generalized_force_at(predicted_x, predicted_y, predicted_phi, wall_y, params);
+    double corrector_drift_x =
+        (dxx * corrector_force.force_x + dxy * corrector_force.force_y) * params.dt;
+    double corrector_drift_y =
+        (dxy * corrector_force.force_x + dyy * corrector_force.force_y) * params.dt;
+    double corrector_dphi = params.d_r * corrector_force.torque * params.dt + noise_phi;
+
+    // 予測子・修正子法で1ステップ進める。phiは毎step正規化しない。
+    xi += corrector_drift_x + noise_x;
+    yi += corrector_drift_y + noise_y;
+    phii += corrector_dphi;
     step_count += 1ULL;
     double ti = static_cast<double>(step_count) * params.dt;
 

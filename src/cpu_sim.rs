@@ -54,6 +54,14 @@ pub struct RodPoint {
     pub y: f64,
 }
 
+/// 棒の重心並進力と角度方向トルクをまとめた一般化力。
+#[derive(Clone, Copy, Debug)]
+struct GeneralizedForce {
+    force_x: f64,
+    force_y: f64,
+    torque: f64,
+}
+
 /// アニメーション用に 1 粒子だけを CPU で逐次計算する状態。
 #[derive(Clone, Debug)]
 pub struct VisualSimulation {
@@ -150,7 +158,7 @@ impl VisualSimulation {
         )
     }
 
-    /// 物理モデルに従って 1 時間刻みだけ状態を更新する。
+    /// 予測子・修正子法で 1 時間刻みだけ状態を更新する。
     fn step(&mut self) {
         if self.steps >= DEFAULT_MAX_STEPS {
             self.completed = true;
@@ -158,33 +166,11 @@ impl VisualSimulation {
         }
 
         let (s, c) = self.phi.sin_cos();
-        let mut rep_sum_x = 0.0;
-        let mut rep_sum_y = 0.0;
-        let mut torque_sum = 0.0;
-
-        for j in -self.params.m..=self.params.m {
-            let offset = f64::from(j) * PARTICLE_DX;
-            let rep_x = self.x + offset * c;
-            let rep_y = self.y + offset * s;
-            let (force_x, force_y) = self.wall_force(rep_x, rep_y);
-
-            rep_sum_x += force_x;
-            rep_sum_y += force_y;
-            torque_sum += offset * (c * force_y - s * force_x);
-        }
-
-        let inv_points = 1.0 / f64::from(self.params.point_count());
-        let total_force_x = self.params.force + rep_sum_x * inv_points;
-        let total_force_y = rep_sum_y * inv_points;
-
         let (sin2, cos2) = (2.0 * self.phi).sin_cos();
         let d_scale = 0.25 * self.diffusion.d_parallel;
         let dxx = d_scale * (3.0 + cos2);
         let dxy = d_scale * sin2;
         let dyy = d_scale * (3.0 - cos2);
-
-        let drift_x = (dxx * total_force_x + dxy * total_force_y) * DT;
-        let drift_y = (dxy * total_force_x + dyy * total_force_y) * DT;
 
         let normal_tx = self.rng.normal();
         let normal_ty = self.rng.normal();
@@ -193,14 +179,29 @@ impl VisualSimulation {
         let noise_body_y = (2.0 * self.diffusion.d_perp * DT).sqrt() * normal_ty;
         let noise_x = c * noise_body_x - s * noise_body_y;
         let noise_y = s * noise_body_x + c * noise_body_y;
+        let noise_phi = (2.0 * self.diffusion.d_r * DT).sqrt() * normal_r;
 
-        let tau_e = self.params.beta_pe * c * (1.0 + self.params.delta_alpha_e_over_p * s);
-        let dphi = self.diffusion.d_r * (torque_sum + tau_e) * DT
-            + (2.0 * self.diffusion.d_r * DT).sqrt() * normal_r;
+        let predictor_force = self.generalized_force_at(self.x, self.y, self.phi);
+        let predictor_drift_x =
+            (dxx * predictor_force.force_x + dxy * predictor_force.force_y) * DT;
+        let predictor_drift_y =
+            (dxy * predictor_force.force_x + dyy * predictor_force.force_y) * DT;
+        let predictor_dphi = self.diffusion.d_r * predictor_force.torque * DT + noise_phi;
 
-        self.x += drift_x + noise_x;
-        self.y += drift_y + noise_y;
-        self.phi += dphi;
+        let predicted_x = self.x + predictor_drift_x + noise_x;
+        let predicted_y = self.y + predictor_drift_y + noise_y;
+        let predicted_phi = self.phi + predictor_dphi;
+
+        let corrector_force = self.generalized_force_at(predicted_x, predicted_y, predicted_phi);
+        let corrector_drift_x =
+            (dxx * corrector_force.force_x + dxy * corrector_force.force_y) * DT;
+        let corrector_drift_y =
+            (dxy * corrector_force.force_x + dyy * corrector_force.force_y) * DT;
+        let corrector_dphi = self.diffusion.d_r * corrector_force.torque * DT + noise_phi;
+
+        self.x += corrector_drift_x + noise_x;
+        self.y += corrector_drift_y + noise_y;
+        self.phi += corrector_dphi;
         self.steps += 1;
         self.t = self.steps as f64 * DT;
 
@@ -209,6 +210,34 @@ impl VisualSimulation {
         }
         if self.steps >= DEFAULT_MAX_STEPS {
             self.completed = true;
+        }
+    }
+
+    /// 指定された状態で、壁反発・外力・電場トルクを合成した一般化力を返す。
+    fn generalized_force_at(&self, x: f64, y: f64, phi: f64) -> GeneralizedForce {
+        let (s, c) = phi.sin_cos();
+        let mut rep_sum_x = 0.0;
+        let mut rep_sum_y = 0.0;
+        let mut torque_sum = 0.0;
+
+        for j in -self.params.m..=self.params.m {
+            let offset = f64::from(j) * PARTICLE_DX;
+            let rep_x = x + offset * c;
+            let rep_y = y + offset * s;
+            let (force_x, force_y) = self.wall_force(rep_x, rep_y);
+
+            rep_sum_x += force_x;
+            rep_sum_y += force_y;
+            torque_sum += offset * (c * force_y - s * force_x);
+        }
+
+        let inv_points = 1.0 / f64::from(self.params.point_count());
+        let tau_e = self.params.beta_pe * c * (1.0 + self.params.delta_alpha_e_over_p * s);
+
+        GeneralizedForce {
+            force_x: self.params.force + rep_sum_x * inv_points,
+            force_y: rep_sum_y * inv_points,
+            torque: torque_sum + tau_e,
         }
     }
 
@@ -252,7 +281,6 @@ fn add_wca_force(
         let s2 = sigma2 / r2;
         let s6 = s2 * s2 * s2;
         let coeff = 24.0 * EPSILON / r2 * s6 * (2.0 * s6 - 1.0);
-        // .clamp(-MAX_VISUAL_WCA_COEFF, MAX_VISUAL_WCA_COEFF);
         *force_x += coeff * dx;
         *force_y += coeff * dy;
     }

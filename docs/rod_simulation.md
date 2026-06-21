@@ -138,6 +138,32 @@ $$\begin{cases}
   d\phi &= D_r (\tau_{\text{rep}} + \tau_E) dt + \sqrt{2D_r} \, dW_r(t)
 \end{cases}$$
 
+### 数値解法
+
+先行研究の Supporting Information に合わせ、Euler-Maruyama 法ではなく予測子・修正子法で 1 step を進める。このシミュレーションでは拡散係数は場所によって変化しないため、予測子と修正子で再評価する対象は棒に働く一般化力
+
+$$
+\bm{G}(\bm{X}, \phi) = (F_x, F_y, \tau_{\text{rep}} + \tau_E)
+$$
+
+だけとする。各 step で同じガウス乱数を使い、まず現在状態 $s_n=(\bm{X}_n,\phi_n)$ から予測点 $s^\*$ を作る。
+
+$$\begin{aligned}
+\bm{X}^\* &= \bm{X}_n + \mathbb{D}_{\text{lab}}(\phi_n)\bm{F}(s_n)\Delta t
+  + \mathbb{R}(\phi_n)\sqrt{2\mathbb{D}\Delta t}\,\bm{\eta}_t,\\
+\phi^\* &= \phi_n + D_r\tau(s_n)\Delta t + \sqrt{2D_r\Delta t}\,\eta_r.
+\end{aligned}$$
+
+次に予測点で一般化力だけを再評価し、最終的な更新を
+
+$$\begin{aligned}
+\bm{X}_{n+1} &= \bm{X}_n + \mathbb{D}_{\text{lab}}(\phi_n)\bm{F}(s^\*)\Delta t
+  + \mathbb{R}(\phi_n)\sqrt{2\mathbb{D}\Delta t}\,\bm{\eta}_t,\\
+\phi_{n+1} &= \phi_n + D_r\tau(s^\*)\Delta t + \sqrt{2D_r\Delta t}\,\eta_r
+\end{aligned}$$
+
+で求める。ここで $\bm{\eta}_t$ と $\eta_r$ は予測子と修正子で共通の標準正規乱数である。$\mathbb{D}_{\text{lab}}(\phi_n)$ とノイズ項は予測点では再評価しないため、壁反発力と電場トルクだけが修正子段階で変わる。
+
 ## 壁面の処理
 
 ### 反発力の計算
