@@ -20,7 +20,7 @@ $$
 今、棒の中心点とそこから左右対称な位置に等間隔にとった $2m$ 個の点の計 $2m+1$ 個の点 $j \in \{-m, -m+1, \ldots, m\}$ には一定の外力 $\bm{f}$ と壁からの反発力 $\bm{f^{\text{rep}}_j}$ が働くので、$\bm{F}$ は次のように表される。
 
 $$
-\bm{F} = \dfrac{1}{2m+1} \sum_{j=-m}^m (\bm{f} + \bm{f}^{\text{rep}}_j)
+\bm{F} = \sum_{j=-m}^m (\bm{f} + \bm{f}^{\text{rep}}_j)
 $$
 
 また、トルク $\tau$ は電気双極子が電場から受ける作用によって生まれるトルク $\tau_{\bm{E}}(\phi)$ と、[壁からの反発力によって生まれるトルク](#電場によるトルクの計算) $\tau^{\text{rep}}$ の和に分けられる。ここで、 $l$ は粒子の長軸方向の長さである。
@@ -140,13 +140,13 @@ $$\begin{cases}
 
 ### 数値解法
 
-先行研究の Supporting Information に合わせ、Euler-Maruyama 法ではなく予測子・修正子法で 1 step を進める。このシミュレーションでは拡散係数は場所によって変化しないため、予測子と修正子で再評価する対象は棒に働く一般化力
+先行研究の Supporting Information に合わせ、Euler-Maruyama 法ではなく予測子・修正子法で 1 step を進める。このシミュレーションでは $D_{\|}$, $D_\perp$, $D_r$ は粒子長だけで決まるが、実験室系の拡散テンソル $\mathbb{D}_{\text{lab}}(\phi)$ と並進ノイズの回転 $\mathbb{R}(\phi)$ は角度 $\phi$ に依存する。そのため、修正子段階では棒に働く一般化力
 
 $$
 \bm{G}(\bm{X}, \phi) = (F_x, F_y, \tau_{\text{rep}} + \tau_E)
 $$
 
-だけとする。各 step で同じガウス乱数を使い、まず現在状態 $s_n=(\bm{X}_n,\phi_n)$ から予測点 $s^\*$ を作る。
+に加えて、$\mathbb{D}_{\text{lab}}(\phi)$ と $\mathbb{R}(\phi)\sqrt{2\mathbb{D}\Delta t}$ も予測角度 $\phi^\*$ で再評価する。各 step で同じガウス乱数を使い、まず現在状態 $s_n=(\bm{X}_n,\phi_n)$ から予測点 $s^\*$ を作る。
 
 $$\begin{aligned}
 \bm{X}^\* &= \bm{X}_n + \mathbb{D}_{\text{lab}}(\phi_n)\bm{F}(s_n)\Delta t
@@ -154,15 +154,15 @@ $$\begin{aligned}
 \phi^\* &= \phi_n + D_r\tau(s_n)\Delta t + \sqrt{2D_r\Delta t}\,\eta_r.
 \end{aligned}$$
 
-次に予測点で一般化力だけを再評価し、最終的な更新を
+次に予測点で一般化力、実験室系の拡散テンソル、並進ノイズの回転を再評価し、最終的な更新を
 
 $$\begin{aligned}
-\bm{X}_{n+1} &= \bm{X}_n + \mathbb{D}_{\text{lab}}(\phi_n)\bm{F}(s^\*)\Delta t
-  + \mathbb{R}(\phi_n)\sqrt{2\mathbb{D}\Delta t}\,\bm{\eta}_t,\\
+\bm{X}_{n+1} &= \bm{X}_n + \mathbb{D}_{\text{lab}}(\phi^\*)\bm{F}(s^\*)\Delta t
+  + \mathbb{R}(\phi^\*)\sqrt{2\mathbb{D}\Delta t}\,\bm{\eta}_t,\\
 \phi_{n+1} &= \phi_n + D_r\tau(s^\*)\Delta t + \sqrt{2D_r\Delta t}\,\eta_r
 \end{aligned}$$
 
-で求める。ここで $\bm{\eta}_t$ と $\eta_r$ は予測子と修正子で共通の標準正規乱数である。$\mathbb{D}_{\text{lab}}(\phi_n)$ とノイズ項は予測点では再評価しないため、壁反発力と電場トルクだけが修正子段階で変わる。
+で求める。ここで $\bm{\eta}_t$ と $\eta_r$ は予測子と修正子で共通の標準正規乱数である。
 
 ## 壁面の処理
 
@@ -263,6 +263,14 @@ $$
 \bm f \mathrel{+}=24\epsilon\frac{1}{r^2}s^6(2s^6-1)\bm d
 $$
 で計算する。
+
+ただし、LJ 型反発力は $r \to 0$ で特異的に大きくなるため、1 つの粒子代表点と 1 つの壁点から受ける反発力ベクトルの大きさには
+
+$$
+|\bm f_{jk}^{\text{rep}}| \leq 2.5\times 10^6
+$$
+
+の上限を設ける。この値は反発力の大きさそのものの上限であり、二乗値ではない。上限を超える場合は、反発力の向きを保ったまま大きさだけを $2.5\times 10^6$ に切り詰めてから合算する。
 
 GPU 実装では、各スレッドが1つの粒子、または1つの粒子代表点を担当し、$q=-K,\ldots,K$ と上下壁に対する固定長ループを回す。候補数が固定されるため、可変長セルリストよりも分岐と間接メモリアクセスが少なく、GPU 上で効率的に実行できる。
 

@@ -5,6 +5,9 @@ use crate::config::{
 };
 use crate::model::{Diffusion, diffusion_for_length, omega, wall_y_samples};
 
+/// 1 つの壁点から受ける WCA 反発力ベクトルの最大値。
+const MAX_WALL_REPULSION_FORCE: f64 = 2.5e2;
+
 /// アニメーションで操作できるシミュレーションパラメータ。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisualParams {
@@ -60,6 +63,16 @@ struct GeneralizedForce {
     force_x: f64,
     force_y: f64,
     torque: f64,
+}
+
+/// 角度から決まる実験室系の拡散テンソルと並進ノイズ。
+#[derive(Clone, Copy, Debug)]
+struct LabTransport {
+    dxx: f64,
+    dxy: f64,
+    dyy: f64,
+    noise_x: f64,
+    noise_y: f64,
 }
 
 /// アニメーション用に 1 粒子だけを CPU で逐次計算する状態。
@@ -165,42 +178,37 @@ impl VisualSimulation {
             return;
         }
 
-        let (s, c) = self.phi.sin_cos();
-        let (sin2, cos2) = (2.0 * self.phi).sin_cos();
-        let d_scale = 0.25 * self.diffusion.d_parallel;
-        let dxx = d_scale * (3.0 + cos2);
-        let dxy = d_scale * sin2;
-        let dyy = d_scale * (3.0 - cos2);
-
         let normal_tx = self.rng.normal();
         let normal_ty = self.rng.normal();
         let normal_r = self.rng.normal();
-        let noise_body_x = (2.0 * self.diffusion.d_parallel * DT).sqrt() * normal_tx;
-        let noise_body_y = (2.0 * self.diffusion.d_perp * DT).sqrt() * normal_ty;
-        let noise_x = c * noise_body_x - s * noise_body_y;
-        let noise_y = s * noise_body_x + c * noise_body_y;
         let noise_phi = (2.0 * self.diffusion.d_r * DT).sqrt() * normal_r;
 
+        let predictor_transport = self.lab_transport_at(self.phi, normal_tx, normal_ty);
         let predictor_force = self.generalized_force_at(self.x, self.y, self.phi);
-        let predictor_drift_x =
-            (dxx * predictor_force.force_x + dxy * predictor_force.force_y) * DT;
-        let predictor_drift_y =
-            (dxy * predictor_force.force_x + dyy * predictor_force.force_y) * DT;
+        let predictor_drift_x = (predictor_transport.dxx * predictor_force.force_x
+            + predictor_transport.dxy * predictor_force.force_y)
+            * DT;
+        let predictor_drift_y = (predictor_transport.dxy * predictor_force.force_x
+            + predictor_transport.dyy * predictor_force.force_y)
+            * DT;
         let predictor_dphi = self.diffusion.d_r * predictor_force.torque * DT + noise_phi;
 
-        let predicted_x = self.x + predictor_drift_x + noise_x;
-        let predicted_y = self.y + predictor_drift_y + noise_y;
+        let predicted_x = self.x + predictor_drift_x + predictor_transport.noise_x;
+        let predicted_y = self.y + predictor_drift_y + predictor_transport.noise_y;
         let predicted_phi = self.phi + predictor_dphi;
 
+        let corrector_transport = self.lab_transport_at(predicted_phi, normal_tx, normal_ty);
         let corrector_force = self.generalized_force_at(predicted_x, predicted_y, predicted_phi);
-        let corrector_drift_x =
-            (dxx * corrector_force.force_x + dxy * corrector_force.force_y) * DT;
-        let corrector_drift_y =
-            (dxy * corrector_force.force_x + dyy * corrector_force.force_y) * DT;
+        let corrector_drift_x = (corrector_transport.dxx * corrector_force.force_x
+            + corrector_transport.dxy * corrector_force.force_y)
+            * DT;
+        let corrector_drift_y = (corrector_transport.dxy * corrector_force.force_x
+            + corrector_transport.dyy * corrector_force.force_y)
+            * DT;
         let corrector_dphi = self.diffusion.d_r * corrector_force.torque * DT + noise_phi;
 
-        self.x += corrector_drift_x + noise_x;
-        self.y += corrector_drift_y + noise_y;
+        self.x += corrector_drift_x + corrector_transport.noise_x;
+        self.y += corrector_drift_y + corrector_transport.noise_y;
         self.phi += corrector_dphi;
         self.steps += 1;
         self.t = self.steps as f64 * DT;
@@ -210,6 +218,23 @@ impl VisualSimulation {
         }
         if self.steps >= DEFAULT_MAX_STEPS {
             self.completed = true;
+        }
+    }
+
+    /// 指定角度における実験室系の拡散テンソルと同じ乱数からの並進ノイズを返す。
+    fn lab_transport_at(&self, phi: f64, normal_tx: f64, normal_ty: f64) -> LabTransport {
+        let (s, c) = phi.sin_cos();
+        let (sin2, cos2) = (2.0 * phi).sin_cos();
+        let d_scale = 0.25 * self.diffusion.d_parallel;
+        let noise_body_x = (2.0 * self.diffusion.d_parallel * DT).sqrt() * normal_tx;
+        let noise_body_y = (2.0 * self.diffusion.d_perp * DT).sqrt() * normal_ty;
+
+        LabTransport {
+            dxx: d_scale * (3.0 + cos2),
+            dxy: d_scale * sin2,
+            dyy: d_scale * (3.0 - cos2),
+            noise_x: c * noise_body_x - s * noise_body_y,
+            noise_y: s * noise_body_x + c * noise_body_y,
         }
     }
 
@@ -231,12 +256,12 @@ impl VisualSimulation {
             torque_sum += offset * (c * force_y - s * force_x);
         }
 
-        let inv_points = 1.0 / f64::from(self.params.point_count());
+        let point_count = f64::from(self.params.point_count());
         let tau_e = self.params.beta_pe * c * (1.0 + self.params.delta_alpha_e_over_p * s);
 
         GeneralizedForce {
-            force_x: self.params.force + rep_sum_x * inv_points,
-            force_y: rep_sum_y * inv_points,
+            force_x: point_count * self.params.force + rep_sum_x,
+            force_y: rep_sum_y,
             torque: torque_sum + tau_e,
         }
     }
@@ -280,8 +305,22 @@ fn add_wca_force(
         let s2 = sigma2 / r2;
         let s6 = s2 * s2 * s2;
         let coeff = 24.0 * EPSILON / r2 * s6 * (2.0 * s6 - 1.0);
-        *force_x += coeff * dx;
-        *force_y += coeff * dy;
+        let (pair_force_x, pair_force_y) = capped_wall_force(coeff * dx, coeff * dy);
+        *force_x += pair_force_x;
+        *force_y += pair_force_y;
+    }
+}
+
+/// 1 つの壁点から受ける反発力の大きさを上限値に収める。
+fn capped_wall_force(force_x: f64, force_y: f64) -> (f64, f64) {
+    let force2 = force_x * force_x + force_y * force_y;
+    let force = force2.sqrt();
+
+    if force > MAX_WALL_REPULSION_FORCE {
+        let scale = MAX_WALL_REPULSION_FORCE / force;
+        (force_x * scale, force_y * scale)
+    } else {
+        (force_x, force_y)
     }
 }
 
@@ -400,5 +439,16 @@ mod tests {
 
         assert_eq!(sim.steps, DEFAULT_MAX_STEPS);
         assert!(sim.completed);
+    }
+
+    /// 壁反発力の大きさが上限値そのものに正規化されることを確認する。
+    #[test]
+    fn capped_wall_force_normalizes_to_max_force() {
+        let input_x = 3.0 * MAX_WALL_REPULSION_FORCE;
+        let input_y = 4.0 * MAX_WALL_REPULSION_FORCE;
+        let (force_x, force_y) = capped_wall_force(input_x, input_y);
+        let magnitude = (force_x * force_x + force_y * force_y).sqrt();
+
+        assert!((magnitude - MAX_WALL_REPULSION_FORCE).abs() < 1.0e-9);
     }
 }

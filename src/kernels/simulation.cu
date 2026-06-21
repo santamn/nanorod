@@ -1,6 +1,9 @@
 #include <curand_kernel.h>
 #include <math_constants.h>
 
+// 1つの壁点から受けるWCA反発力ベクトルの最大値。
+#define MAX_WALL_REPULSION_FORCE 2.5e6
+
 // Rust側ではcuRAND stateの具体サイズを直接知らないため、trialごとに256 bytesを確保する。
 static_assert(
     sizeof(curandStatePhilox4_32_10_t) <= 256,
@@ -36,6 +39,16 @@ struct GeneralizedForce
   double force_x;
   double force_y;
   double torque;
+};
+
+// 角度から決まる実験室系の拡散テンソルと並進ノイズをまとめる。
+struct LabTransport
+{
+  double dxx;
+  double dxy;
+  double dyy;
+  double noise_x;
+  double noise_y;
 };
 
 // byte buffer上に確保したcuRAND state領域から、trial i のstateポインタを取り出す。
@@ -93,8 +106,21 @@ __device__ void add_wca_force(
     double s2 = sigma2 / r2;
     double s6 = s2 * s2 * s2;
     double coeff = 24.0 * params.epsilon / r2 * s6 * (2.0 * s6 - 1.0);
-    *force_x += coeff * dx;
-    *force_y += coeff * dy;
+    double pair_force_x = coeff * dx;
+    double pair_force_y = coeff * dy;
+    double pair_force2 = pair_force_x * pair_force_x + pair_force_y * pair_force_y;
+    double pair_force = sqrt(pair_force2);
+
+    // 近接時の特異的な壁反発だけを上限値に収め、反発方向は保つ。
+    if (pair_force > MAX_WALL_REPULSION_FORCE)
+    {
+      double scale = MAX_WALL_REPULSION_FORCE / pair_force;
+      pair_force_x *= scale;
+      pair_force_y *= scale;
+    }
+
+    *force_x += pair_force_x;
+    *force_y += pair_force_y;
   }
 }
 
@@ -140,13 +166,37 @@ __device__ GeneralizedForce generalized_force_at(
     torque_sum += offset * (c * force_y - s * force_x);
   }
 
-  double inv_points = 1.0 / static_cast<double>(params.point_count);
   double tau_e = params.beta_pe * c * (1.0 + params.delta_alpha_e_over_p * s);
 
   GeneralizedForce result;
-  result.force_x = params.force + rep_sum_x * inv_points;
-  result.force_y = rep_sum_y * inv_points;
+  result.force_x = static_cast<double>(params.point_count) * params.force + rep_sum_x;
+  result.force_y = rep_sum_y;
   result.torque = torque_sum + tau_e;
+  return result;
+}
+
+// 指定角度における実験室系の拡散テンソルと同じ乱数からの並進ノイズを返す。
+__device__ LabTransport lab_transport_at(
+    double phii,
+    double2 normal_t,
+    const KernelParams params)
+{
+  double s, c;
+  sincos(phii, &s, &c);
+
+  double cos2, sin2;
+  sincos(2.0 * phii, &sin2, &cos2);
+  double d_scale = 0.25 * params.d_parallel;
+
+  double noise_body_x = sqrt(2.0 * params.d_parallel * params.dt) * normal_t.x;
+  double noise_body_y = sqrt(2.0 * params.d_perp * params.dt) * normal_t.y;
+
+  LabTransport result;
+  result.dxx = d_scale * (3.0 + cos2);
+  result.dxy = d_scale * sin2;
+  result.dyy = d_scale * (3.0 - cos2);
+  result.noise_x = c * noise_body_x - s * noise_body_y;
+  result.noise_y = s * noise_body_x + c * noise_body_y;
   return result;
 }
 
@@ -261,49 +311,44 @@ extern "C" __global__ void simulate_kernel(
       break;
     }
 
-    double s, c;
-    sincos(phii, &s, &c);
-    GeneralizedForce predictor_force = generalized_force_at(xi, yi, phii, wall_y, params);
-
-    double cos2, sin2;
-    sincos(2.0 * phii, &sin2, &cos2);
-    double d_scale = 0.25 * params.d_parallel;
-    double dxx = d_scale * (3.0 + cos2);
-    double dxy = d_scale * sin2;
-    double dyy = d_scale * (3.0 - cos2);
-
     // 並進に2個、回転に1個の標準正規乱数を使う。
     double2 normal_t = curand_normal2_double(state);
     double normal_r = curand_normal_double(state);
-
-    double noise_body_x = sqrt(2.0 * params.d_parallel * params.dt) * normal_t.x;
-    double noise_body_y = sqrt(2.0 * params.d_perp * params.dt) * normal_t.y;
-    double noise_x = c * noise_body_x - s * noise_body_y;
-    double noise_y = s * noise_body_x + c * noise_body_y;
     double noise_phi = sqrt(2.0 * params.d_r * params.dt) * normal_r;
 
+    LabTransport predictor_transport = lab_transport_at(phii, normal_t, params);
+    GeneralizedForce predictor_force = generalized_force_at(xi, yi, phii, wall_y, params);
     double predictor_drift_x =
-        (dxx * predictor_force.force_x + dxy * predictor_force.force_y) * params.dt;
+        (predictor_transport.dxx * predictor_force.force_x +
+         predictor_transport.dxy * predictor_force.force_y) *
+        params.dt;
     double predictor_drift_y =
-        (dxy * predictor_force.force_x + dyy * predictor_force.force_y) * params.dt;
+        (predictor_transport.dxy * predictor_force.force_x +
+         predictor_transport.dyy * predictor_force.force_y) *
+        params.dt;
     double predictor_dphi = params.d_r * predictor_force.torque * params.dt + noise_phi;
 
-    double predicted_x = xi + predictor_drift_x + noise_x;
-    double predicted_y = yi + predictor_drift_y + noise_y;
+    double predicted_x = xi + predictor_drift_x + predictor_transport.noise_x;
+    double predicted_y = yi + predictor_drift_y + predictor_transport.noise_y;
     double predicted_phi = phii + predictor_dphi;
 
-    // 拡散係数は予測点で再評価せず、論文の修正子段階に相当する力だけを後点で評価する。
+    // 論文の修正子段階に合わせ、力・拡散テンソル・並進ノイズを予測角度で再評価する。
+    LabTransport corrector_transport = lab_transport_at(predicted_phi, normal_t, params);
     GeneralizedForce corrector_force =
         generalized_force_at(predicted_x, predicted_y, predicted_phi, wall_y, params);
     double corrector_drift_x =
-        (dxx * corrector_force.force_x + dxy * corrector_force.force_y) * params.dt;
+        (corrector_transport.dxx * corrector_force.force_x +
+         corrector_transport.dxy * corrector_force.force_y) *
+        params.dt;
     double corrector_drift_y =
-        (dxy * corrector_force.force_x + dyy * corrector_force.force_y) * params.dt;
+        (corrector_transport.dxy * corrector_force.force_x +
+         corrector_transport.dyy * corrector_force.force_y) *
+        params.dt;
     double corrector_dphi = params.d_r * corrector_force.torque * params.dt + noise_phi;
 
     // 予測子・修正子法で1ステップ進める。phiは毎step正規化しない。
-    xi += corrector_drift_x + noise_x;
-    yi += corrector_drift_y + noise_y;
+    xi += corrector_drift_x + corrector_transport.noise_x;
+    yi += corrector_drift_y + corrector_transport.noise_y;
     phii += corrector_dphi;
     step_count += 1ULL;
     double ti = static_cast<double>(step_count) * params.dt;
