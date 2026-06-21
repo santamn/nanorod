@@ -5,8 +5,6 @@ use crate::config::{
 };
 use crate::model::{Diffusion, diffusion_for_length, omega, wall_y_samples};
 
-const MAX_VISUAL_WCA_COEFF: f64 = 2.5e6;
-
 /// アニメーションで操作できるシミュレーションパラメータ。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisualParams {
@@ -253,8 +251,8 @@ fn add_wca_force(
         let sigma2 = SIGMA * SIGMA;
         let s2 = sigma2 / r2;
         let s6 = s2 * s2 * s2;
-        let coeff = (24.0 * EPSILON / r2 * s6 * (2.0 * s6 - 1.0))
-            .clamp(-MAX_VISUAL_WCA_COEFF, MAX_VISUAL_WCA_COEFF);
+        let coeff = 24.0 * EPSILON / r2 * s6 * (2.0 * s6 - 1.0);
+        // .clamp(-MAX_VISUAL_WCA_COEFF, MAX_VISUAL_WCA_COEFF);
         *force_x += coeff * dx;
         *force_y += coeff * dy;
     }
