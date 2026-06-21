@@ -273,11 +273,10 @@ fn add_wca_force(
     let dx = rep_x - wall_x;
     let dy = rep_y - wall_y;
     let r2 = dx * dx + dy * dy;
-    let rc = 2.0_f64.powf(1.0 / 6.0) * SIGMA;
-    let rc2 = rc * rc;
+    let sigma2 = SIGMA * SIGMA;
+    let rc2 = 2.0_f64.powf(1.0 / 3.0) * sigma2;
 
-    if r2 > 0.0 && r2 < rc2 {
-        let sigma2 = SIGMA * SIGMA;
+    if r2 < rc2 {
         let s2 = sigma2 / r2;
         let s6 = s2 * s2 * s2;
         let coeff = 24.0 * EPSILON / r2 * s6 * (2.0 * s6 - 1.0);
