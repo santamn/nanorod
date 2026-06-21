@@ -1,10 +1,13 @@
 use std::f64::consts::PI;
 
-use crate::config::{DT, EPSILON, PARTICLE_DX, SIGMA, SimParams, WALL_DX, WALL_K, particle_length};
+use crate::config::{
+    DEFAULT_MAX_STEPS, DT, EPSILON, PARTICLE_DX, SIGMA, SimParams, WALL_DX, WALL_K, particle_length,
+};
 use crate::model::{Diffusion, diffusion_for_length, omega, wall_y_samples};
 
 const MAX_VISUAL_WCA_COEFF: f64 = 2.5e6;
 
+/// アニメーションで操作できるシミュレーションパラメータ。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct VisualParams {
     pub seed: u64,
@@ -15,6 +18,7 @@ pub struct VisualParams {
 }
 
 impl Default for VisualParams {
+    /// UI 起動時に使う見やすさ優先の既定値を返す。
     fn default() -> Self {
         Self {
             seed: 1,
@@ -27,6 +31,7 @@ impl Default for VisualParams {
 }
 
 impl VisualParams {
+    /// GPU/CPU 共通の物理パラメータ構造へ変換する。
     pub fn sim_params(self) -> SimParams {
         SimParams {
             combo_id: 0,
@@ -38,17 +43,20 @@ impl VisualParams {
         }
     }
 
+    /// 棒状粒子を計算上で代表する点の数を返す。
     pub fn point_count(self) -> i32 {
         2 * self.m + 1
     }
 }
 
+/// 棒上の 1 つの代表点または端点の座標。
 #[derive(Clone, Copy, Debug)]
 pub struct RodPoint {
     pub x: f64,
     pub y: f64,
 }
 
+/// アニメーション用に 1 粒子だけを CPU で逐次計算する状態。
 #[derive(Clone, Debug)]
 pub struct VisualSimulation {
     pub params: VisualParams,
@@ -62,12 +70,14 @@ pub struct VisualSimulation {
     pub target_x: f64,
     pub t: f64,
     pub steps: u64,
+    pub first_passed: bool,
     pub completed: bool,
     rng: SplitMixRng,
     wall_y: Vec<f64>,
 }
 
 impl VisualSimulation {
+    /// seed と可視化パラメータから初期状態を決定的に生成する。
     pub fn new(params: VisualParams) -> Self {
         let mut rng = SplitMixRng::new(params.seed);
         let sim_params = params.sim_params();
@@ -95,18 +105,26 @@ impl VisualSimulation {
             target_x: x0 + 1.0,
             t: 0.0,
             steps: 0,
+            first_passed: false,
             completed: false,
             rng,
             wall_y: wall_y_samples(),
         }
     }
 
+    /// パラメータ変更時に乱数系列も含めて初期状態を作り直す。
     pub fn reset(&mut self, params: VisualParams) {
         *self = Self::new(params);
     }
 
+    /// 指定ステップだけ進めるが、最大ステップ到達後は進めない。
     pub fn step_many(&mut self, step_count: usize) {
         if self.completed {
+            return;
+        }
+
+        if self.steps >= DEFAULT_MAX_STEPS {
+            self.completed = true;
             return;
         }
 
@@ -118,20 +136,29 @@ impl VisualSimulation {
         }
     }
 
-    pub fn representative_points(&self) -> Vec<RodPoint> {
+    /// 描画用に棒の両端だけを返す。
+    pub fn rod_endpoints(&self) -> (RodPoint, RodPoint) {
         let (s, c) = self.phi.sin_cos();
-        (-self.params.m..=self.params.m)
-            .map(|j| {
-                let offset = f64::from(j) * PARTICLE_DX;
-                RodPoint {
-                    x: self.x + offset * c,
-                    y: self.y + offset * s,
-                }
-            })
-            .collect()
+        let half_l = f64::from(self.params.m) * PARTICLE_DX;
+        (
+            RodPoint {
+                x: self.x - half_l * c,
+                y: self.y - half_l * s,
+            },
+            RodPoint {
+                x: self.x + half_l * c,
+                y: self.y + half_l * s,
+            },
+        )
     }
 
+    /// 物理モデルに従って 1 時間刻みだけ状態を更新する。
     fn step(&mut self) {
+        if self.steps >= DEFAULT_MAX_STEPS {
+            self.completed = true;
+            return;
+        }
+
         let (s, c) = self.phi.sin_cos();
         let mut rep_sum_x = 0.0;
         let mut rep_sum_y = 0.0;
@@ -179,11 +206,15 @@ impl VisualSimulation {
         self.steps += 1;
         self.t = self.steps as f64 * DT;
 
-        if self.x > self.target_x {
+        if !self.first_passed && self.x > self.target_x {
+            self.first_passed = true;
+        }
+        if self.steps >= DEFAULT_MAX_STEPS {
             self.completed = true;
         }
     }
 
+    /// 近傍の壁サンプル点だけから WCA 反発力を合算する。
     fn wall_force(&self, rep_x: f64, rep_y: f64) -> (f64, f64) {
         let mut force_x = 0.0;
         let mut force_y = 0.0;
@@ -203,6 +234,7 @@ impl VisualSimulation {
     }
 }
 
+/// 1 つの粒子代表点と 1 つの壁点から WCA 反発力を加算する。
 fn add_wca_force(
     rep_x: f64,
     rep_y: f64,
@@ -228,11 +260,13 @@ fn add_wca_force(
     }
 }
 
+/// 負のインデックスも周期境界へ正しく折り返す剰余を返す。
 fn positive_mod(value: i64, modulus: i64) -> i64 {
     let r = value % modulus;
     if r < 0 { r + modulus } else { r }
 }
 
+/// 壁サンプル点の最近傍インデックスを整数へ丸める。
 fn round_to_i64(value: f64) -> i64 {
     if value >= 0.0 {
         (value + 0.5) as i64
@@ -241,6 +275,7 @@ fn round_to_i64(value: f64) -> i64 {
     }
 }
 
+/// GPU 側と同じ seed から再現性のある乱数列を作る簡易 RNG。
 #[derive(Clone, Debug)]
 struct SplitMixRng {
     state: u64,
@@ -248,6 +283,7 @@ struct SplitMixRng {
 }
 
 impl SplitMixRng {
+    /// 指定 seed で乱数生成器を初期化する。
     fn new(seed: u64) -> Self {
         Self {
             state: seed,
@@ -255,6 +291,7 @@ impl SplitMixRng {
         }
     }
 
+    /// SplitMix64 の次の 64bit 値を生成する。
     fn next_u64(&mut self) -> u64 {
         self.state = self.state.wrapping_add(0x9E37_79B9_7F4A_7C15);
         let mut z = self.state;
@@ -263,12 +300,14 @@ impl SplitMixRng {
         z ^ (z >> 31)
     }
 
+    /// 0 と 1 を含まない一様乱数を返す。
     fn uniform_open01(&mut self) -> f64 {
         const SCALE: f64 = 1.0 / ((1_u64 << 53) as f64);
         let bits = self.next_u64() >> 11;
         ((bits as f64) + 0.5) * SCALE
     }
 
+    /// Box-Muller 法で標準正規乱数を返す。
     fn normal(&mut self) -> f64 {
         if let Some(value) = self.cached_normal.take() {
             return value;
@@ -288,6 +327,7 @@ impl SplitMixRng {
 mod tests {
     use super::*;
 
+    /// 短時間の更新で有限な状態が保たれることを確認する。
     #[test]
     fn visual_simulation_advances_with_finite_state() {
         let mut sim = VisualSimulation::new(VisualParams::default());
@@ -299,6 +339,7 @@ mod tests {
         assert_eq!(sim.steps, 128);
     }
 
+    /// アニメーション相当の短い実行で発散しないことを確認する。
     #[test]
     fn visual_simulation_stays_bounded_during_short_animation_run() {
         let mut sim = VisualSimulation::new(VisualParams::default());
@@ -311,13 +352,28 @@ mod tests {
         assert!(sim.y.abs() < 10.0);
     }
 
+    /// x_0 + L 通過後も最大ステップ到達までは完了扱いにしないことを確認する。
     #[test]
-    fn representative_point_count_matches_m() {
-        let sim = VisualSimulation::new(VisualParams {
-            m: 4,
-            ..VisualParams::default()
-        });
+    fn visual_simulation_keeps_running_after_first_passage() {
+        let mut sim = VisualSimulation::new(VisualParams::default());
+        sim.x = sim.target_x + 0.01;
+        sim.step_many(1);
 
-        assert_eq!(sim.representative_points().len(), 9);
+        assert!(sim.first_passed);
+        assert!(!sim.completed);
+        assert_eq!(sim.steps, 1);
+    }
+
+    /// `DEFAULT_MAX_STEPS` でアニメーションが完了扱いになることを確認する。
+    #[test]
+    fn visual_simulation_completes_at_default_max_steps() {
+        let mut sim = VisualSimulation::new(VisualParams::default());
+        sim.steps = DEFAULT_MAX_STEPS - 1;
+        sim.t = sim.steps as f64 * DT;
+
+        sim.step_many(8);
+
+        assert_eq!(sim.steps, DEFAULT_MAX_STEPS);
+        assert!(sim.completed);
     }
 }
