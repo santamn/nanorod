@@ -11,6 +11,9 @@ pub const WALL_DX: f64 = 0.25 * SIGMA;
 pub const PARTICLE_DX: f64 = 0.8 * SIGMA;
 pub const N_WALL: usize = (L_PERIOD / WALL_DX) as usize;
 pub const WALL_K: i32 = 5;
+pub const MAX_WALL_REPULSION_FORCE: f64 = 2.5e4;
+pub const BOUNDARY_REFLECTION_LIMIT: usize = 32;
+pub const CHANNEL_NECK_PHASE: f64 = 0.809_640_837_312_333_2;
 pub const RNG_STATE_BYTES: usize = 256;
 pub const DEFAULT_MAX_STEPS: u64 = 250_000_000; // 2.5 × 10^8
 pub const DEFAULT_PRODUCTION_TRIALS: usize = 1000;
@@ -197,6 +200,14 @@ mod tests {
             assert_eq!(2 * m + 1, points);
             assert_eq!(particle_length(m), 2.0 * f64::from(m) * 0.8 * SIGMA);
         }
+    }
+
+    /// 境界補正と反発力上限に使う数値安全用の共通定数を確認する。
+    #[test]
+    fn numerical_safety_constants_match_shared_model() {
+        assert_eq!(MAX_WALL_REPULSION_FORCE, 2.5e4);
+        assert_eq!(BOUNDARY_REFLECTION_LIMIT, 32);
+        assert!((CHANNEL_NECK_PHASE - 0.809_640_837_312_333_2).abs() < 1.0e-15);
     }
 
     #[test]

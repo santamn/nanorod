@@ -1,7 +1,8 @@
 use serde::Serialize;
 
 use crate::config::{
-    EPSILON, L_PERIOD, N_WALL, SIGMA, SimParams, WALL_DX, WALL_K, particle_length,
+    BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, EPSILON, L_PERIOD, N_WALL, SIGMA, SimParams,
+    WALL_DX, WALL_K, particle_length,
 };
 
 // CUDA kernel と共有する trial の状態コード。
@@ -147,7 +148,7 @@ pub fn omega(x: f64) -> f64 {
     two_pi_x.sin() + 0.25 * (2.0 * two_pi_x).sin() + 1.12
 }
 
-/// 予測点を境界で反転した修正子評価用の状態。
+/// 境界条件を満たすように鏡像反射した棒の重心状態。
 #[derive(Clone, Copy, Debug)]
 pub struct BoundaryCorrectedState {
     pub x: f64,
@@ -169,34 +170,58 @@ fn omega_second_derivative(x: f64) -> f64 {
     -four_pi_sq * two_pi_x.sin() - four_pi_sq * (2.0 * two_pi_x).sin()
 }
 
-/// 境界外に出た予測点を、最寄り境界の接線に対して鏡映した状態へ補正する。
-pub fn correct_predicted_state_for_boundary(x: f64, y: f64, phi: f64) -> BoundaryCorrectedState {
+/// 境界外に出た棒状態を、現在位置側の境界の接線に対して鏡像反射で流路内へ戻す。
+pub fn reflect_state_into_channel(
+    x: f64,
+    y: f64,
+    phi: f64,
+    anchor_x: f64,
+) -> BoundaryCorrectedState {
+    let mut state = BoundaryCorrectedState {
+        x,
+        y,
+        phi,
+        reflected: false,
+    };
+
+    for _ in 0..BOUNDARY_REFLECTION_LIMIT {
+        let Some(sign) = boundary_wall_sign(state.x, state.y) else {
+            return state;
+        };
+
+        state = reflect_state_at_wall(state, sign, anchor_x);
+    }
+
+    state
+}
+
+/// 流路外にある場合は、越えている上壁または下壁の符号を返す。
+fn boundary_wall_sign(x: f64, y: f64) -> Option<f64> {
     let width = omega(x);
 
     if y > width {
-        reflect_state_at_wall(x, y, phi, 1.0)
+        Some(1.0)
     } else if y < -width {
-        reflect_state_at_wall(x, y, phi, -1.0)
+        Some(-1.0)
     } else {
-        BoundaryCorrectedState {
-            x,
-            y,
-            phi,
-            reflected: false,
-        }
+        None
     }
 }
 
-/// 上壁または下壁に対して重心位置と棒の向きを鏡映する。
-fn reflect_state_at_wall(x: f64, y: f64, phi: f64, sign: f64) -> BoundaryCorrectedState {
-    let foot_x = perpendicular_foot_x(x, y, sign);
+/// 上壁または下壁に対して重心位置と棒の向きを 1 回だけ鏡像反射する。
+fn reflect_state_at_wall(
+    state: BoundaryCorrectedState,
+    sign: f64,
+    anchor_x: f64,
+) -> BoundaryCorrectedState {
+    let foot_x = perpendicular_foot_x(state.x, state.y, sign, anchor_x);
     let foot_y = sign * omega(foot_x);
     let slope = sign * omega_derivative(foot_x);
 
     BoundaryCorrectedState {
-        x: 2.0 * foot_x - x,
-        y: 2.0 * foot_y - y,
-        phi: reflect_angle_across_tangent(phi, slope),
+        x: 2.0 * foot_x - state.x,
+        y: 2.0 * foot_y - state.y,
+        phi: reflect_angle_across_tangent(state.phi, slope),
         reflected: true,
     }
 }
@@ -207,20 +232,27 @@ fn reflect_angle_across_tangent(phi: f64, slope: f64) -> f64 {
 }
 
 /// 点から上壁または下壁へ下ろした垂線の足の x 座標を Newton 法で求める。
-fn perpendicular_foot_x(px: f64, py: f64, sign: f64) -> f64 {
+fn perpendicular_foot_x(px: f64, py: f64, sign: f64, initial_x: f64) -> f64 {
     const EPSILON: f64 = 1.0e-10;
     const NEWTON_STEPS: usize = 5;
 
-    let mut x = px;
+    let (section_min_x, section_max_x) = channel_section_bounds(initial_x);
+    let mut x = initial_x.clamp(section_min_x, section_max_x);
     for _ in 0..NEWTON_STEPS {
         let d = wall_foot_newton_delta(px, py, sign, x);
         if d.abs() > EPSILON {
-            x -= d;
+            x = (x - d).clamp(section_min_x, section_max_x);
         } else {
             break;
         }
     }
     x
+}
+
+/// 現在位置が属する流路の膨らみ区間を、左右のくびれの x 座標で返す。
+fn channel_section_bounds(anchor_x: f64) -> (f64, f64) {
+    let section_min_x = (anchor_x - CHANNEL_NECK_PHASE).floor() + CHANNEL_NECK_PHASE;
+    (section_min_x, section_min_x + L_PERIOD)
 }
 
 /// 壁への垂線の足を求める Newton 法の 1 step 分の補正量を返す。
@@ -408,7 +440,7 @@ mod tests {
         let outside_distance = 0.08;
         let outside_x = foot_x - slope / normal_len * outside_distance;
         let outside_y = foot_y + 1.0 / normal_len * outside_distance;
-        let corrected = correct_predicted_state_for_boundary(outside_x, outside_y, 0.5);
+        let corrected = reflect_state_into_channel(outside_x, outside_y, 0.5, outside_x);
 
         assert!(corrected.reflected);
         assert!((corrected.x - (foot_x + slope / normal_len * outside_distance)).abs() < 1e-9);
@@ -425,7 +457,7 @@ mod tests {
         let outside_x = foot_x - slope / normal_len * 0.08;
         let outside_y = foot_y + 1.0 / normal_len * 0.08;
         let phi = 0.5;
-        let corrected = correct_predicted_state_for_boundary(outside_x, outside_y, phi);
+        let corrected = reflect_state_into_channel(outside_x, outside_y, phi, outside_x);
 
         assert!(corrected.reflected);
         assert!((corrected.phi - (2.0 * slope.atan() - phi)).abs() < 1e-9);
@@ -434,12 +466,34 @@ mod tests {
     /// 流路内の予測点は補正されず、そのまま修正子段階へ渡されることを確認する。
     #[test]
     fn boundary_correction_keeps_inside_prediction() {
-        let corrected = correct_predicted_state_for_boundary(0.25, 0.0, 1.2);
+        let corrected = reflect_state_into_channel(0.25, 0.0, 1.2, 0.25);
 
         assert!(!corrected.reflected);
         assert!((corrected.x - 0.25).abs() < 1e-12);
         assert!(corrected.y.abs() < 1e-12);
         assert!((corrected.phi - 1.2).abs() < 1e-12);
+    }
+
+    /// くびれを越えた予測点でも現在位置側から垂線の足を探索することを確認する。
+    #[test]
+    fn boundary_correction_starts_wall_foot_search_from_current_x() {
+        let current_x = 0.70;
+        let predicted_x = 0.84;
+        let predicted_y = omega(predicted_x) + 0.03;
+        let corrected = reflect_state_into_channel(predicted_x, predicted_y, 0.0, current_x);
+
+        assert!(corrected.reflected);
+        assert!(corrected.x < 0.8096408373123332);
+    }
+
+    /// くびれ付近で大きく壁外に出た状態も、複数回の鏡像反射で流路内へ戻ることを確認する。
+    #[test]
+    fn boundary_reflection_repeats_until_state_is_inside_channel() {
+        let neck_x = 0.8096408373123332;
+        let corrected = reflect_state_into_channel(neck_x, omega(neck_x) + 0.46, 0.0, neck_x);
+
+        assert!(corrected.reflected);
+        assert!(corrected.y.abs() <= omega(corrected.x) + 1.0e-12);
     }
 
     #[test]

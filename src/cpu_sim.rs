@@ -1,14 +1,12 @@
 use std::f64::consts::PI;
 
 use crate::config::{
-    DEFAULT_MAX_STEPS, DT, EPSILON, PARTICLE_DX, SIGMA, SimParams, WALL_DX, WALL_K, particle_length,
+    DEFAULT_MAX_STEPS, DT, EPSILON, MAX_WALL_REPULSION_FORCE, PARTICLE_DX, SIGMA, SimParams,
+    WALL_DX, WALL_K, particle_length,
 };
 use crate::model::{
-    Diffusion, correct_predicted_state_for_boundary, diffusion_for_length, omega, wall_y_samples,
+    Diffusion, diffusion_for_length, omega, reflect_state_into_channel, wall_y_samples,
 };
-
-/// 1 つの壁点から受ける WCA 反発力ベクトルの最大値。
-const MAX_WALL_REPULSION_FORCE: f64 = 2.5e4;
 
 /// アニメーションで操作できるシミュレーションパラメータ。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -70,6 +68,14 @@ struct LabTransport {
     dyy: f64,
     noise_x: f64,
     noise_y: f64,
+}
+
+/// 1 step 内で重心位置と角度へ加える増分。
+#[derive(Clone, Copy, Debug)]
+struct StepIncrement {
+    dx: f64,
+    dy: f64,
+    dphi: f64,
 }
 
 /// アニメーション用に 1 粒子だけを CPU で逐次計算する状態。
@@ -182,40 +188,33 @@ impl VisualSimulation {
 
         let predictor_transport = self.lab_transport_at(self.phi, normal_tx, normal_ty);
         let predictor_force = self.generalized_force_at(self.x, self.y, self.phi);
-        let predictor_drift_x = (predictor_transport.dxx * predictor_force.force_x
-            + predictor_transport.dxy * predictor_force.force_y)
-            * DT;
-        let predictor_drift_y = (predictor_transport.dxy * predictor_force.force_x
-            + predictor_transport.dyy * predictor_force.force_y)
-            * DT;
-        let predictor_dphi = self.diffusion.d_r * predictor_force.torque * DT + noise_phi;
+        let predictor_increment =
+            self.step_increment(predictor_transport, predictor_force, noise_phi);
+        let anchor_x = self.x;
 
-        let predicted_x = self.x + predictor_drift_x + predictor_transport.noise_x;
-        let predicted_y = self.y + predictor_drift_y + predictor_transport.noise_y;
-        let predicted_phi = self.phi + predictor_dphi;
-
-        // 境界外の予測点は壁に対して鏡映し、修正子段階の評価状態として使う。
-        let corrected_prediction =
-            correct_predicted_state_for_boundary(predicted_x, predicted_y, predicted_phi);
-
-        let corrector_transport =
-            self.lab_transport_at(corrected_prediction.phi, normal_tx, normal_ty);
-        let corrector_force = self.generalized_force_at(
-            corrected_prediction.x,
-            corrected_prediction.y,
-            corrected_prediction.phi,
+        // 予測子で境界外へ出た状態は、修正子評価の前に流路内へ鏡像反射する。
+        let predicted = reflect_state_into_channel(
+            self.x + predictor_increment.dx,
+            self.y + predictor_increment.dy,
+            self.phi + predictor_increment.dphi,
+            anchor_x,
         );
-        let corrector_drift_x = (corrector_transport.dxx * corrector_force.force_x
-            + corrector_transport.dxy * corrector_force.force_y)
-            * DT;
-        let corrector_drift_y = (corrector_transport.dxy * corrector_force.force_x
-            + corrector_transport.dyy * corrector_force.force_y)
-            * DT;
-        let corrector_dphi = self.diffusion.d_r * corrector_force.torque * DT + noise_phi;
 
-        self.x += corrector_drift_x + corrector_transport.noise_x;
-        self.y += corrector_drift_y + corrector_transport.noise_y;
-        self.phi += corrector_dphi;
+        let corrector_transport = self.lab_transport_at(predicted.phi, normal_tx, normal_ty);
+        let corrector_force = self.generalized_force_at(predicted.x, predicted.y, predicted.phi);
+        let corrector_increment =
+            self.step_increment(corrector_transport, corrector_force, noise_phi);
+
+        // 修正子で得た最終状態も、保存前に同じ境界条件で鏡像反射する。
+        let corrected = reflect_state_into_channel(
+            self.x + corrector_increment.dx,
+            self.y + corrector_increment.dy,
+            self.phi + corrector_increment.dphi,
+            anchor_x,
+        );
+        self.x = corrected.x;
+        self.y = corrected.y;
+        self.phi = corrected.phi;
         self.steps += 1;
         self.t = self.steps as f64 * DT;
 
@@ -224,6 +223,24 @@ impl VisualSimulation {
         }
         if self.steps >= DEFAULT_MAX_STEPS {
             self.completed = true;
+        }
+    }
+
+    /// 実験室系の輸送係数と一般化力から、1 step 分の状態増分を作る。
+    fn step_increment(
+        &self,
+        transport: LabTransport,
+        force: GeneralizedForce,
+        noise_phi: f64,
+    ) -> StepIncrement {
+        let drift_x = (transport.dxx * force.force_x + transport.dxy * force.force_y) * DT;
+        let drift_y = (transport.dxy * force.force_x + transport.dyy * force.force_y) * DT;
+        let dphi = self.diffusion.d_r * force.torque * DT + noise_phi;
+
+        StepIncrement {
+            dx: drift_x + transport.noise_x,
+            dy: drift_y + transport.noise_y,
+            dphi,
         }
     }
 
@@ -419,6 +436,23 @@ mod tests {
         assert!(sim.phi.is_finite());
         assert!(sim.x.abs() < 10.0);
         assert!(sim.y.abs() < 10.0);
+    }
+
+    /// 強い外力条件でも、各 step 後の重心が流路内へ鏡像反射されることを確認する。
+    #[test]
+    fn visual_simulation_reflects_high_force_state_inside_channel() {
+        let mut sim = VisualSimulation::new(VisualParams {
+            m: 20,
+            force: 100.0,
+            beta_pe: 0.0,
+            delta_alpha_e_over_p: 0.0,
+            ..VisualParams::default()
+        });
+
+        for _ in 0..70_000 {
+            sim.step();
+            assert!(sim.y.abs() <= omega(sim.x) + 1.0e-9);
+        }
     }
 
     /// x_0 + L 通過後も最大ステップ到達までは完了扱いにしないことを確認する。

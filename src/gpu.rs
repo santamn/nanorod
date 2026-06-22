@@ -5,7 +5,8 @@ use cudarc::driver::{CudaContext, DeviceRepr, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 
 use crate::config::{
-    DT, EPSILON, RNG_STATE_BYTES, SIGMA, SimParams, WALL_DX, WALL_K, default_trial_count,
+    BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, DT, EPSILON, MAX_WALL_REPULSION_FORCE,
+    RNG_STATE_BYTES, SIGMA, SimParams, WALL_DX, WALL_K, default_trial_count,
 };
 use crate::model::{
     SummaryRow, TrialResult, diffusion_for_length, summarize_trials, wall_y_samples,
@@ -24,7 +25,7 @@ struct KernelParams {
     m: i32,
     n_wall: i32,
     wall_k: i32,
-    _pad0: i32,
+    boundary_reflection_limit: i32,
     l: f64,
     beta_pe: f64,
     delta_alpha_e_over_p: f64,
@@ -38,6 +39,8 @@ struct KernelParams {
     wall_dx: f64,
     particle_dx: f64,
     rc2: f64,
+    max_wall_repulsion_force: f64,
+    channel_neck_phase: f64,
 }
 
 unsafe impl DeviceRepr for KernelParams {}
@@ -53,7 +56,7 @@ impl KernelParams {
             m: params.m,
             n_wall: crate::config::N_WALL as i32,
             wall_k: WALL_K,
-            _pad0: 0,
+            boundary_reflection_limit: BOUNDARY_REFLECTION_LIMIT as i32,
             l: params.l,
             beta_pe: params.beta_pe,
             delta_alpha_e_over_p: params.delta_alpha_e_over_p,
@@ -67,6 +70,8 @@ impl KernelParams {
             wall_dx: WALL_DX,
             particle_dx: crate::config::PARTICLE_DX,
             rc2: rc * rc,
+            max_wall_repulsion_force: MAX_WALL_REPULSION_FORCE,
+            channel_neck_phase: CHANNEL_NECK_PHASE,
         }
     }
 }

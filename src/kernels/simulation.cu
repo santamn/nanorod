@@ -1,9 +1,6 @@
 #include <curand_kernel.h>
 #include <math_constants.h>
 
-// 1つの壁点から受けるWCA反発力ベクトルの最大値。
-#define MAX_WALL_REPULSION_FORCE 2.5e6
-
 // Rust側ではcuRAND stateの具体サイズを直接知らないため、trialごとに256 bytesを確保する。
 static_assert(
     sizeof(curandStatePhilox4_32_10_t) <= 256,
@@ -16,7 +13,7 @@ struct KernelParams
   int m;
   int n_wall;
   int wall_k;
-  int _pad0;
+  int boundary_reflection_limit;
   double l;
   double beta_pe;
   double delta_alpha_e_over_p;
@@ -30,6 +27,8 @@ struct KernelParams
   double wall_dx;
   double particle_dx;
   double rc2;
+  double max_wall_repulsion_force;
+  double channel_neck_phase;
 };
 
 // 並進力と角度方向トルクをまとめ、予測点と修正点で同じ力計算を使い回す。
@@ -50,7 +49,7 @@ struct LabTransport
   double noise_y;
 };
 
-// 予測点を境界で反転した修正子評価用の状態。
+// 境界条件を満たすように鏡像反射した棒の重心状態。
 struct RodState
 {
   double x;
@@ -106,18 +105,42 @@ __device__ double wall_foot_newton_delta(
   return fma(w_p, w_sub, x - px) / fma(w_pp, w_sub, fma(w_p, w_p, 1.0));
 }
 
+// 指定値を閉区間に収める。
+__device__ double clamp_double(double value, double min_value, double max_value)
+{
+  return fmin(fmax(value, min_value), max_value);
+}
+
+// 現在位置が属する流路の膨らみ区間を、左右のくびれのx座標で返す。
+__device__ void channel_section_bounds(
+    double anchor_x,
+    const KernelParams params,
+    double *section_min_x,
+    double *section_max_x)
+{
+  *section_min_x = floor(anchor_x - params.channel_neck_phase) + params.channel_neck_phase;
+  *section_max_x = *section_min_x + 1.0;
+}
+
 // 点から上壁または下壁へ下ろした垂線の足のx座標をNewton法で求める。
-__device__ double perpendicular_foot_x(double px, double py, double sign)
+__device__ double perpendicular_foot_x(
+    double px,
+    double py,
+    double sign,
+    double initial_x,
+    const KernelParams params)
 {
   constexpr double EPSILON = 1.0e-10;
-  double x = px;
+  double section_min_x, section_max_x;
+  channel_section_bounds(initial_x, params, &section_min_x, &section_max_x);
+  double x = clamp_double(initial_x, section_min_x, section_max_x);
 
   for (int i = 0; i < 5; ++i)
   {
     double d = wall_foot_newton_delta(px, py, sign, x);
     if (fabs(d) > EPSILON)
     {
-      x -= d;
+      x = clamp_double(x - d, section_min_x, section_max_x);
     }
     else
     {
@@ -134,39 +157,66 @@ __device__ double reflect_angle_across_tangent(double phii, double slope)
   return 2.0 * atan(slope) - phii;
 }
 
-// 境界外に出た予測点を、最寄り境界の接線に対して鏡映した状態へ補正する。
-__device__ RodState correct_predicted_state_for_boundary(
+// 流路外にある場合は、越えている上壁または下壁の符号を返す。
+__device__ double boundary_wall_sign(double xi, double yi)
+{
+  double width = omega(xi);
+  if (yi > width)
+  {
+    return 1.0;
+  }
+  else if (yi < -width)
+  {
+    return -1.0;
+  }
+  else
+  {
+    return 0.0;
+  }
+}
+
+// 上壁または下壁に対して重心位置と棒の向きを1回だけ鏡像反射する。
+__device__ RodState reflect_state_at_wall(
+    RodState state,
+    double sign,
+    double anchor_x,
+    const KernelParams params)
+{
+  double foot_x = perpendicular_foot_x(state.x, state.y, sign, anchor_x, params);
+  double foot_y = sign * omega(foot_x);
+  double slope = sign * omega_derivative(foot_x);
+
+  RodState result;
+  result.x = 2.0 * foot_x - state.x;
+  result.y = 2.0 * foot_y - state.y;
+  result.phi = reflect_angle_across_tangent(state.phi, slope);
+  return result;
+}
+
+// 境界外に出た棒状態を、現在位置側の境界の接線に対して鏡像反射で流路内へ戻す。
+__device__ RodState reflect_state_into_channel(
     double xi,
     double yi,
-    double phii)
+    double phii,
+    double anchor_x,
+    const KernelParams params)
 {
   RodState result;
   result.x = xi;
   result.y = yi;
   result.phi = phii;
 
-  double width = omega(xi);
-  double sign = 0.0;
-  if (yi > width)
+  for (int i = 0; i < params.boundary_reflection_limit; ++i)
   {
-    sign = 1.0;
-  }
-  else if (yi < -width)
-  {
-    sign = -1.0;
-  }
-  else
-  {
-    return result;
+    double sign = boundary_wall_sign(result.x, result.y);
+    if (sign == 0.0)
+    {
+      return result;
+    }
+
+    result = reflect_state_at_wall(result, sign, anchor_x, params);
   }
 
-  double foot_x = perpendicular_foot_x(xi, yi, sign);
-  double foot_y = sign * omega(foot_x);
-  double slope = sign * omega_derivative(foot_x);
-
-  result.x = 2.0 * foot_x - xi;
-  result.y = 2.0 * foot_y - yi;
-  result.phi = reflect_angle_across_tangent(phii, slope);
   return result;
 }
 
@@ -212,9 +262,9 @@ __device__ void add_wca_force(
     double pair_force = sqrt(pair_force2);
 
     // 近接時の特異的な壁反発だけを上限値に収め、反発方向は保つ。
-    if (pair_force > MAX_WALL_REPULSION_FORCE)
+    if (pair_force > params.max_wall_repulsion_force)
     {
-      double scale = MAX_WALL_REPULSION_FORCE / pair_force;
+      double scale = params.max_wall_repulsion_force / pair_force;
       pair_force_x *= scale;
       pair_force_y *= scale;
     }
@@ -432,18 +482,18 @@ extern "C" __global__ void simulate_kernel(
     double predicted_y = yi + predictor_drift_y + predictor_transport.noise_y;
     double predicted_phi = phii + predictor_dphi;
 
-    // 境界外の予測点は壁に対して鏡映し、修正子段階の評価状態として使う。
-    RodState corrected_prediction =
-        correct_predicted_state_for_boundary(predicted_x, predicted_y, predicted_phi);
+    // 予測子で境界外へ出た状態は、修正子評価の前に流路内へ鏡像反射する。
+    RodState predicted =
+        reflect_state_into_channel(predicted_x, predicted_y, predicted_phi, xi, params);
 
     // 論文の修正子段階に合わせ、力・拡散テンソル・並進ノイズを補正後の予測角度で再評価する。
     LabTransport corrector_transport =
-        lab_transport_at(corrected_prediction.phi, normal_t, params);
+        lab_transport_at(predicted.phi, normal_t, params);
     GeneralizedForce corrector_force =
         generalized_force_at(
-            corrected_prediction.x,
-            corrected_prediction.y,
-            corrected_prediction.phi,
+            predicted.x,
+            predicted.y,
+            predicted.phi,
             wall_y,
             params);
     double corrector_drift_x =
@@ -456,10 +506,17 @@ extern "C" __global__ void simulate_kernel(
         params.dt;
     double corrector_dphi = params.d_r * corrector_force.torque * params.dt + noise_phi;
 
-    // 予測子・修正子法で1ステップ進める。phiは毎step正規化しない。
-    xi += corrector_drift_x + corrector_transport.noise_x;
-    yi += corrector_drift_y + corrector_transport.noise_y;
-    phii += corrector_dphi;
+    // 修正子で得た最終状態も、保存前に同じ境界条件で鏡像反射する。
+    RodState corrected =
+        reflect_state_into_channel(
+            xi + corrector_drift_x + corrector_transport.noise_x,
+            yi + corrector_drift_y + corrector_transport.noise_y,
+            phii + corrector_dphi,
+            xi,
+            params);
+    xi = corrected.x;
+    yi = corrected.y;
+    phii = corrected.phi;
     step_count += 1ULL;
     double ti = static_cast<double>(step_count) * params.dt;
 
