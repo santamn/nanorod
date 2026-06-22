@@ -16,7 +16,6 @@ struct KernelParams
   int m;
   int n_wall;
   int wall_k;
-  int point_count;
   int _pad0;
   double l;
   double beta_pe;
@@ -51,6 +50,14 @@ struct LabTransport
   double noise_y;
 };
 
+// 予測点を境界で反転した修正子評価用の状態。
+struct RodState
+{
+  double x;
+  double y;
+  double phi;
+};
+
 // byte buffer上に確保したcuRAND state領域から、trial i のstateポインタを取り出す。
 __device__ curandStatePhilox4_32_10_t *rng_state_at(
     unsigned char *rng_states,
@@ -68,6 +75,99 @@ __device__ double omega(double x)
   double s, c;
   sincospi(2.0 * x, &s, &c);
   return s + 0.5 * s * c + 1.12;
+}
+
+// 流路の半幅 omega(x) の一階微分を返す。
+__device__ double omega_derivative(double x)
+{
+  double s, c;
+  sincospi(2.0 * x, &s, &c);
+  return fma(c, fma(2.0 * CUDART_PI, c, 2.0 * CUDART_PI), -CUDART_PI);
+}
+
+// 壁への垂線の足を求めるNewton法の1 step分の補正量を返す。
+__device__ double wall_foot_newton_delta(
+    double px,
+    double py,
+    double sign,
+    double x)
+{
+  constexpr double MINUS_FOUR_PI_SQ = -4.0 * CUDART_PI * CUDART_PI;
+  constexpr double MINUS_EIGHT_PI_SQ = -8.0 * CUDART_PI * CUDART_PI;
+
+  double s, c;
+  sincospi(2.0 * x, &s, &c);
+
+  double offset = 1.12 - sign * py;
+  double w_sub = fma(s, fma(0.5, c, 1.0), offset);
+  double w_p = fma(c, fma(2.0 * CUDART_PI, c, 2.0 * CUDART_PI), -CUDART_PI);
+  double w_pp = s * fma(MINUS_EIGHT_PI_SQ, c, MINUS_FOUR_PI_SQ);
+
+  return fma(w_p, w_sub, x - px) / fma(w_pp, w_sub, fma(w_p, w_p, 1.0));
+}
+
+// 点から上壁または下壁へ下ろした垂線の足のx座標をNewton法で求める。
+__device__ double perpendicular_foot_x(double px, double py, double sign)
+{
+  constexpr double EPSILON = 1.0e-10;
+  double x = px;
+
+  for (int i = 0; i < 5; ++i)
+  {
+    double d = wall_foot_newton_delta(px, py, sign, x);
+    if (fabs(d) > EPSILON)
+    {
+      x -= d;
+    }
+    else
+    {
+      break;
+    }
+  }
+
+  return x;
+}
+
+// 境界の接線方向へ棒の向きベクトルを鏡映した角度を返す。
+__device__ double reflect_angle_across_tangent(double phii, double slope)
+{
+  return 2.0 * atan(slope) - phii;
+}
+
+// 境界外に出た予測点を、最寄り境界の接線に対して鏡映した状態へ補正する。
+__device__ RodState correct_predicted_state_for_boundary(
+    double xi,
+    double yi,
+    double phii)
+{
+  RodState result;
+  result.x = xi;
+  result.y = yi;
+  result.phi = phii;
+
+  double width = omega(xi);
+  double sign = 0.0;
+  if (yi > width)
+  {
+    sign = 1.0;
+  }
+  else if (yi < -width)
+  {
+    sign = -1.0;
+  }
+  else
+  {
+    return result;
+  }
+
+  double foot_x = perpendicular_foot_x(xi, yi, sign);
+  double foot_y = sign * omega(foot_x);
+  double slope = sign * omega_derivative(foot_x);
+
+  result.x = 2.0 * foot_x - xi;
+  result.y = 2.0 * foot_y - yi;
+  result.phi = reflect_angle_across_tangent(phii, slope);
+  return result;
 }
 
 // 負の周期インデックスも壁配列へ正しく写すための剰余。
@@ -124,7 +224,7 @@ __device__ void add_wca_force(
   }
 }
 
-// 指定された棒状態で、壁反発・外力・電場トルクを合成した一般化力を返す。
+// 指定された棒状態で、壁反発・粒子全体への外力・電場トルクを合成した一般化力を返す。
 __device__ GeneralizedForce generalized_force_at(
     double xi,
     double yi,
@@ -169,7 +269,7 @@ __device__ GeneralizedForce generalized_force_at(
   double tau_e = params.beta_pe * c * (1.0 + params.delta_alpha_e_over_p * s);
 
   GeneralizedForce result;
-  result.force_x = static_cast<double>(params.point_count) * params.force + rep_sum_x;
+  result.force_x = params.force + rep_sum_x;
   result.force_y = rep_sum_y;
   result.torque = torque_sum + tau_e;
   return result;
@@ -332,10 +432,20 @@ extern "C" __global__ void simulate_kernel(
     double predicted_y = yi + predictor_drift_y + predictor_transport.noise_y;
     double predicted_phi = phii + predictor_dphi;
 
-    // 論文の修正子段階に合わせ、力・拡散テンソル・並進ノイズを予測角度で再評価する。
-    LabTransport corrector_transport = lab_transport_at(predicted_phi, normal_t, params);
+    // 境界外の予測点は壁に対して鏡映し、修正子段階の評価状態として使う。
+    RodState corrected_prediction =
+        correct_predicted_state_for_boundary(predicted_x, predicted_y, predicted_phi);
+
+    // 論文の修正子段階に合わせ、力・拡散テンソル・並進ノイズを補正後の予測角度で再評価する。
+    LabTransport corrector_transport =
+        lab_transport_at(corrected_prediction.phi, normal_t, params);
     GeneralizedForce corrector_force =
-        generalized_force_at(predicted_x, predicted_y, predicted_phi, wall_y, params);
+        generalized_force_at(
+            corrected_prediction.x,
+            corrected_prediction.y,
+            corrected_prediction.phi,
+            wall_y,
+            params);
     double corrector_drift_x =
         (corrector_transport.dxx * corrector_force.force_x +
          corrector_transport.dxy * corrector_force.force_y) *

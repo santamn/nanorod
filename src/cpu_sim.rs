@@ -3,10 +3,12 @@ use std::f64::consts::PI;
 use crate::config::{
     DEFAULT_MAX_STEPS, DT, EPSILON, PARTICLE_DX, SIGMA, SimParams, WALL_DX, WALL_K, particle_length,
 };
-use crate::model::{Diffusion, diffusion_for_length, omega, wall_y_samples};
+use crate::model::{
+    Diffusion, correct_predicted_state_for_boundary, diffusion_for_length, omega, wall_y_samples,
+};
 
 /// 1 つの壁点から受ける WCA 反発力ベクトルの最大値。
-const MAX_WALL_REPULSION_FORCE: f64 = 2.5e2;
+const MAX_WALL_REPULSION_FORCE: f64 = 2.5e4;
 
 /// アニメーションで操作できるシミュレーションパラメータ。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -24,9 +26,9 @@ impl Default for VisualParams {
         Self {
             seed: 1,
             m: 8,
-            force: 10.0,
-            beta_pe: 1.0,
-            delta_alpha_e_over_p: 1.0,
+            force: 0.0,
+            beta_pe: 0.0,
+            delta_alpha_e_over_p: 0.0,
         }
     }
 }
@@ -42,11 +44,6 @@ impl VisualParams {
             delta_alpha_e_over_p: self.delta_alpha_e_over_p,
             force: self.force,
         }
-    }
-
-    /// 棒状粒子を計算上で代表する点の数を返す。
-    pub fn point_count(self) -> i32 {
-        2 * self.m + 1
     }
 }
 
@@ -197,8 +194,17 @@ impl VisualSimulation {
         let predicted_y = self.y + predictor_drift_y + predictor_transport.noise_y;
         let predicted_phi = self.phi + predictor_dphi;
 
-        let corrector_transport = self.lab_transport_at(predicted_phi, normal_tx, normal_ty);
-        let corrector_force = self.generalized_force_at(predicted_x, predicted_y, predicted_phi);
+        // 境界外の予測点は壁に対して鏡映し、修正子段階の評価状態として使う。
+        let corrected_prediction =
+            correct_predicted_state_for_boundary(predicted_x, predicted_y, predicted_phi);
+
+        let corrector_transport =
+            self.lab_transport_at(corrected_prediction.phi, normal_tx, normal_ty);
+        let corrector_force = self.generalized_force_at(
+            corrected_prediction.x,
+            corrected_prediction.y,
+            corrected_prediction.phi,
+        );
         let corrector_drift_x = (corrector_transport.dxx * corrector_force.force_x
             + corrector_transport.dxy * corrector_force.force_y)
             * DT;
@@ -238,7 +244,7 @@ impl VisualSimulation {
         }
     }
 
-    /// 指定された状態で、壁反発・外力・電場トルクを合成した一般化力を返す。
+    /// 指定された状態で、壁反発・粒子全体への外力・電場トルクを合成した一般化力を返す。
     fn generalized_force_at(&self, x: f64, y: f64, phi: f64) -> GeneralizedForce {
         let (s, c) = phi.sin_cos();
         let mut rep_sum_x = 0.0;
@@ -256,11 +262,10 @@ impl VisualSimulation {
             torque_sum += offset * (c * force_y - s * force_x);
         }
 
-        let point_count = f64::from(self.params.point_count());
         let tau_e = self.params.beta_pe * c * (1.0 + self.params.delta_alpha_e_over_p * s);
 
         GeneralizedForce {
-            force_x: point_count * self.params.force + rep_sum_x,
+            force_x: self.params.force + rep_sum_x,
             force_y: rep_sum_y,
             torque: torque_sum + tau_e,
         }
@@ -439,6 +444,24 @@ mod tests {
 
         assert_eq!(sim.steps, DEFAULT_MAX_STEPS);
         assert!(sim.completed);
+    }
+
+    /// x 方向外力は代表点ごとの力ではなく、粒子全体への合力として扱うことを確認する。
+    #[test]
+    fn external_force_is_not_scaled_by_representative_points() {
+        for m in [1, 30] {
+            let sim = VisualSimulation::new(VisualParams {
+                m,
+                force: 7.0,
+                beta_pe: 0.0,
+                delta_alpha_e_over_p: 0.0,
+                ..VisualParams::default()
+            });
+            let force = sim.generalized_force_at(0.25, 0.0, 0.0);
+
+            assert!((force.force_x - 7.0).abs() < 1.0e-12);
+            assert!(force.force_y.abs() < 1.0e-12);
+        }
     }
 
     /// 壁反発力の大きさが上限値そのものに正規化されることを確認する。

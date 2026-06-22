@@ -147,6 +147,91 @@ pub fn omega(x: f64) -> f64 {
     two_pi_x.sin() + 0.25 * (2.0 * two_pi_x).sin() + 1.12
 }
 
+/// 予測点を境界で反転した修正子評価用の状態。
+#[derive(Clone, Copy, Debug)]
+pub struct BoundaryCorrectedState {
+    pub x: f64,
+    pub y: f64,
+    pub phi: f64,
+    pub reflected: bool,
+}
+
+/// 流路の半幅 `omega(x)` の一階微分。
+pub fn omega_derivative(x: f64) -> f64 {
+    let two_pi_x = 2.0 * std::f64::consts::PI * x;
+    2.0 * std::f64::consts::PI * two_pi_x.cos() + std::f64::consts::PI * (2.0 * two_pi_x).cos()
+}
+
+/// 流路の半幅 `omega(x)` の二階微分。
+fn omega_second_derivative(x: f64) -> f64 {
+    let two_pi_x = 2.0 * std::f64::consts::PI * x;
+    let four_pi_sq = 4.0 * std::f64::consts::PI * std::f64::consts::PI;
+    -four_pi_sq * two_pi_x.sin() - four_pi_sq * (2.0 * two_pi_x).sin()
+}
+
+/// 境界外に出た予測点を、最寄り境界の接線に対して鏡映した状態へ補正する。
+pub fn correct_predicted_state_for_boundary(x: f64, y: f64, phi: f64) -> BoundaryCorrectedState {
+    let width = omega(x);
+
+    if y > width {
+        reflect_state_at_wall(x, y, phi, 1.0)
+    } else if y < -width {
+        reflect_state_at_wall(x, y, phi, -1.0)
+    } else {
+        BoundaryCorrectedState {
+            x,
+            y,
+            phi,
+            reflected: false,
+        }
+    }
+}
+
+/// 上壁または下壁に対して重心位置と棒の向きを鏡映する。
+fn reflect_state_at_wall(x: f64, y: f64, phi: f64, sign: f64) -> BoundaryCorrectedState {
+    let foot_x = perpendicular_foot_x(x, y, sign);
+    let foot_y = sign * omega(foot_x);
+    let slope = sign * omega_derivative(foot_x);
+
+    BoundaryCorrectedState {
+        x: 2.0 * foot_x - x,
+        y: 2.0 * foot_y - y,
+        phi: reflect_angle_across_tangent(phi, slope),
+        reflected: true,
+    }
+}
+
+/// 境界の接線方向へ棒の向きベクトルを鏡映した角度を返す。
+fn reflect_angle_across_tangent(phi: f64, slope: f64) -> f64 {
+    2.0 * slope.atan() - phi
+}
+
+/// 点から上壁または下壁へ下ろした垂線の足の x 座標を Newton 法で求める。
+fn perpendicular_foot_x(px: f64, py: f64, sign: f64) -> f64 {
+    const EPSILON: f64 = 1.0e-10;
+    const NEWTON_STEPS: usize = 5;
+
+    let mut x = px;
+    for _ in 0..NEWTON_STEPS {
+        let d = wall_foot_newton_delta(px, py, sign, x);
+        if d.abs() > EPSILON {
+            x -= d;
+        } else {
+            break;
+        }
+    }
+    x
+}
+
+/// 壁への垂線の足を求める Newton 法の 1 step 分の補正量を返す。
+fn wall_foot_newton_delta(px: f64, py: f64, sign: f64, x: f64) -> f64 {
+    let w_sub = omega(x) - sign * py;
+    let w_p = omega_derivative(x);
+    let w_pp = omega_second_derivative(x);
+
+    (w_p * w_sub + x - px) / (w_pp * w_sub + w_p * w_p + 1.0)
+}
+
 /// 1周期分の上壁 y 座標を事前サンプリングする。
 ///
 /// 下壁は CUDA kernel 側で符号を反転して参照する。
@@ -311,6 +396,50 @@ mod tests {
         for x in [-2.3, -0.1, 0.0, 0.25, 0.7, 3.2] {
             assert!((omega(x) - omega(x + 1.0)).abs() < 1e-12);
         }
+    }
+
+    /// 上壁の外側に出た予測点が境界の内側へ鏡映されることを確認する。
+    #[test]
+    fn boundary_correction_reflects_upper_wall_prediction() {
+        let foot_x = 0.31;
+        let foot_y = omega(foot_x);
+        let slope = omega_derivative(foot_x);
+        let normal_len = (slope * slope + 1.0).sqrt();
+        let outside_distance = 0.08;
+        let outside_x = foot_x - slope / normal_len * outside_distance;
+        let outside_y = foot_y + 1.0 / normal_len * outside_distance;
+        let corrected = correct_predicted_state_for_boundary(outside_x, outside_y, 0.5);
+
+        assert!(corrected.reflected);
+        assert!((corrected.x - (foot_x + slope / normal_len * outside_distance)).abs() < 1e-9);
+        assert!((corrected.y - (foot_y - 1.0 / normal_len * outside_distance)).abs() < 1e-9);
+    }
+
+    /// 上壁の接線に対して棒の角度が鏡映されることを確認する。
+    #[test]
+    fn boundary_correction_reflects_angle_across_upper_tangent() {
+        let foot_x = 0.31;
+        let foot_y = omega(foot_x);
+        let slope = omega_derivative(foot_x);
+        let normal_len = (slope * slope + 1.0).sqrt();
+        let outside_x = foot_x - slope / normal_len * 0.08;
+        let outside_y = foot_y + 1.0 / normal_len * 0.08;
+        let phi = 0.5;
+        let corrected = correct_predicted_state_for_boundary(outside_x, outside_y, phi);
+
+        assert!(corrected.reflected);
+        assert!((corrected.phi - (2.0 * slope.atan() - phi)).abs() < 1e-9);
+    }
+
+    /// 流路内の予測点は補正されず、そのまま修正子段階へ渡されることを確認する。
+    #[test]
+    fn boundary_correction_keeps_inside_prediction() {
+        let corrected = correct_predicted_state_for_boundary(0.25, 0.0, 1.2);
+
+        assert!(!corrected.reflected);
+        assert!((corrected.x - 0.25).abs() < 1e-12);
+        assert!(corrected.y.abs() < 1e-12);
+        assert!((corrected.phi - 1.2).abs() < 1e-12);
     }
 
     #[test]
