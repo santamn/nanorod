@@ -14,7 +14,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use config::{
-    Cli, RunMode, SimParams, all_parameter_combinations, production_parameter_combinations,
+    Cli, RunMode, SimParams, production_parameter_combinations, smoke_parameter_combination,
     validate_devices,
 };
 use gpu::{ComboOutput, ComboWork, GpuProgress, GpuRunConfig};
@@ -73,10 +73,7 @@ fn create_new_output_dir(path: &Path) -> Result<()> {
 ///
 /// trial 詳細を出力し、GPU 1,2,3 へ trial を分割して multi-GPU 経路も確認する。
 fn run_smoke(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> Result<()> {
-    let combos = all_parameter_combinations();
-    let params = *combos
-        .get(cli.smoke_combo_id)
-        .with_context(|| format!("smoke combo id {} is out of range", cli.smoke_combo_id))?;
+    let params = smoke_parameter_combination(cli.smoke_combo_id, cli.smoke_m)?;
     let splits = split_trials(trial_count, cli.devices.len());
     create_new_output_dir(&cli.output_dir)?;
 

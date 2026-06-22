@@ -10,6 +10,11 @@ pub const STATUS_RUNNING: i32 = 0;
 pub const STATUS_OK: i32 = 1;
 pub const STATUS_MAX_STEPS: i32 = 2;
 
+// CUDA kernel と共有する1周期通過方向のコード。
+pub const PASS_DIRECTION_NONE: i32 = 0;
+pub const PASS_DIRECTION_RIGHT: i32 = 1;
+pub const PASS_DIRECTION_LEFT: i32 = -1;
+
 /// 基準長で固定した D_0 によって無次元化された拡散係数。
 ///
 /// `d_perp` は仕様書の簡略化に従い、Tirado の値ではなく `0.5 * d_parallel` を使う。
@@ -47,6 +52,7 @@ pub struct TrialResult {
     pub t: f64,
     pub steps: u64,
     pub status: i32,
+    pub pass_direction: i32,
 }
 
 /// smoke run で出力する trial 詳細 CSV の1行。
@@ -70,6 +76,7 @@ pub struct TrialCsvRow {
     pub t: f64,
     pub steps: u64,
     pub status: &'static str,
+    pub pass_direction: &'static str,
 }
 
 /// パラメータ組み合わせごとの集計 JSON の1要素。
@@ -86,7 +93,10 @@ pub struct SummaryRow {
     pub f: f64,
     pub n_total: usize,
     pub n_ok: usize,
+    pub n_right_passes: usize,
+    pub n_left_passes: usize,
     pub n_max_steps: usize,
+    pub passage_fraction: f64,
     #[serde(rename = "T1")]
     pub t1: f64,
     #[serde(rename = "T2")]
@@ -137,6 +147,7 @@ impl TrialResult {
             t: self.t,
             steps: self.steps,
             status: status_label(self.status),
+            pass_direction: pass_direction_label(self.pass_direction),
         }
     }
 }
@@ -147,6 +158,16 @@ pub fn status_label(status: i32) -> &'static str {
         STATUS_OK => "ok",
         STATUS_MAX_STEPS => "max_steps",
         STATUS_RUNNING => "running",
+        _ => "unknown",
+    }
+}
+
+/// CUDA kernel と同じ通過方向コードを、人間が読めるラベルへ変換する。
+pub fn pass_direction_label(direction: i32) -> &'static str {
+    match direction {
+        PASS_DIRECTION_RIGHT => "right",
+        PASS_DIRECTION_LEFT => "left",
+        PASS_DIRECTION_NONE => "not_passed",
         _ => "unknown",
     }
 }
@@ -329,18 +350,29 @@ pub fn summarize_trials(
     seed: u64,
     times: &[f64],
     statuses: &[i32],
+    pass_directions: &[i32],
 ) -> SummaryRow {
+    debug_assert_eq!(times.len(), statuses.len());
+    debug_assert_eq!(statuses.len(), pass_directions.len());
+
     let mut n_ok = 0usize;
+    let mut n_right_passes = 0usize;
+    let mut n_left_passes = 0usize;
     let mut n_max_steps = 0usize;
     let mut sum_t = 0.0f64;
     let mut sum_t2 = 0.0f64;
 
-    for (&time, &status) in times.iter().zip(statuses) {
+    for ((&time, &status), &pass_direction) in times.iter().zip(statuses).zip(pass_directions) {
         match status {
             STATUS_OK => {
                 n_ok += 1;
                 sum_t += time;
                 sum_t2 += time * time;
+                match pass_direction {
+                    PASS_DIRECTION_RIGHT => n_right_passes += 1,
+                    PASS_DIRECTION_LEFT => n_left_passes += 1,
+                    _ => {}
+                }
             }
             STATUS_MAX_STEPS => n_max_steps += 1,
             _ => {}
@@ -369,7 +401,10 @@ pub fn summarize_trials(
         f: params.force,
         n_total,
         n_ok,
+        n_right_passes,
+        n_left_passes,
         n_max_steps,
+        passage_fraction: n_ok as f64 / n_total as f64,
         t1,
         t2,
         v,
@@ -390,6 +425,8 @@ pub fn aggregate_summaries(
 ) -> SummaryRow {
     let n_total = partials.iter().map(|row| row.n_total).sum();
     let n_ok: usize = partials.iter().map(|row| row.n_ok).sum();
+    let n_right_passes = partials.iter().map(|row| row.n_right_passes).sum();
+    let n_left_passes = partials.iter().map(|row| row.n_left_passes).sum();
     let n_max_steps = partials.iter().map(|row| row.n_max_steps).sum();
 
     let mut sum_t = 0.0;
@@ -423,7 +460,10 @@ pub fn aggregate_summaries(
         f: params.force,
         n_total,
         n_ok,
+        n_right_passes,
+        n_left_passes,
         n_max_steps,
+        passage_fraction: n_ok as f64 / n_total as f64,
         t1,
         t2,
         v,
@@ -536,6 +576,36 @@ mod tests {
             assert!(diffusion.d_perp.is_finite() && diffusion.d_perp > 0.0);
             assert!(diffusion.d_r.is_finite() && diffusion.d_r > 0.0);
         }
+    }
+
+    /// 初通過した trial だけを平均しつつ、左右どちらへ通過したかを数えることを確認する。
+    #[test]
+    fn summarize_trials_counts_pass_directions() {
+        let params = SimParams {
+            combo_id: 7,
+            m: 3,
+            l: particle_length(3),
+            beta_pe: 0.25,
+            delta_alpha_e_over_p: 0.5,
+            force: 1.0,
+        };
+        let times = [1.0, 2.0, 0.0];
+        let statuses = [STATUS_OK, STATUS_OK, STATUS_MAX_STEPS];
+        let pass_directions = [
+            PASS_DIRECTION_RIGHT,
+            PASS_DIRECTION_LEFT,
+            PASS_DIRECTION_NONE,
+        ];
+
+        let summary = summarize_trials(2, params, 3, 11, &times, &statuses, &pass_directions);
+
+        assert_eq!(summary.n_ok, 2);
+        assert_eq!(summary.n_right_passes, 1);
+        assert_eq!(summary.n_left_passes, 1);
+        assert_eq!(summary.n_max_steps, 1);
+        assert!((summary.passage_fraction - 2.0 / 3.0).abs() < 1.0e-12);
+        assert!((summary.t1 - 1.5).abs() < 1.0e-12);
+        assert!((summary.t2 - 2.5).abs() < 1.0e-12);
     }
 
     /// 基準長そのものでは、固定 D_0 の式が従来の同一棒長正規化と一致することを確認する。

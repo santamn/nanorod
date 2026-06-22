@@ -14,6 +14,7 @@ use eframe::egui;
 use egui::{
     Color32, FontData, FontDefinitions, FontFamily, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2,
 };
+use model::{PASS_DIRECTION_LEFT, PASS_DIRECTION_RIGHT};
 
 const TRAIL_LIMIT: usize = 900; // 重心の軌跡を保持する最大点数
 const CHANNEL_Y_SPAN: f64 = 5.25;
@@ -200,12 +201,8 @@ impl eframe::App for AnimationApp {
                     ));
                     ui.end_row();
 
-                    ui.label("x_0 + Lを通過");
-                    ui.label(if self.simulation.first_passed {
-                        "済"
-                    } else {
-                        "未"
-                    });
+                    ui.label("x_0 ± Lを通過");
+                    ui.label(pass_direction_display(self.simulation.pass_direction));
                     ui.end_row();
                 });
 
@@ -300,6 +297,15 @@ fn display_angle(phi: f64) -> f64 {
     phi.rem_euclid(std::f64::consts::TAU)
 }
 
+/// 初通過方向を操作パネルへ表示する短い日本語ラベルへ変換する。
+fn pass_direction_display(direction: i32) -> &'static str {
+    match direction {
+        PASS_DIRECTION_RIGHT => "右",
+        PASS_DIRECTION_LEFT => "左",
+        _ => "未",
+    }
+}
+
 /// 現在の粒子状態と流路をキャンバスへ描画する。
 fn draw_simulation(
     painter: &egui::Painter,
@@ -364,7 +370,7 @@ fn draw_channel(painter: &egui::Painter, world: &WorldView) {
     }
 }
 
-/// 初期位置と x_0 + L 通過判定位置を縦線で示す。
+/// 初期位置と x_0 ± L 通過判定位置を縦線で示す。
 fn draw_markers(painter: &egui::Painter, world: &WorldView, simulation: &VisualSimulation) {
     let start_a = world.to_screen(simulation.x0, world.y_min);
     let start_b = world.to_screen(simulation.x0, world.y_max);
@@ -373,8 +379,15 @@ fn draw_markers(painter: &egui::Painter, world: &WorldView, simulation: &VisualS
         Stroke::new(1.8, Color32::from_rgba_premultiplied(44, 105, 185, 190)),
     );
 
-    let target_a = world.to_screen(simulation.target_x, world.y_min);
-    let target_b = world.to_screen(simulation.target_x, world.y_max);
+    let left_target_a = world.to_screen(simulation.target_left_x, world.y_min);
+    let left_target_b = world.to_screen(simulation.target_left_x, world.y_max);
+    painter.line_segment(
+        [left_target_a, left_target_b],
+        Stroke::new(2.2, Color32::from_rgba_premultiplied(58, 130, 83, 220)),
+    );
+
+    let target_a = world.to_screen(simulation.target_right_x, world.y_min);
+    let target_b = world.to_screen(simulation.target_right_x, world.y_max);
     painter.line_segment(
         [target_a, target_b],
         Stroke::new(2.2, Color32::from_rgba_premultiplied(215, 72, 43, 220)),

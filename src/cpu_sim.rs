@@ -5,7 +5,8 @@ use crate::config::{
     WALL_DX, WALL_K, particle_length,
 };
 use crate::model::{
-    Diffusion, diffusion_for_length, omega, reflect_state_into_channel, wall_y_samples,
+    Diffusion, PASS_DIRECTION_LEFT, PASS_DIRECTION_NONE, PASS_DIRECTION_RIGHT,
+    diffusion_for_length, omega, reflect_state_into_channel, wall_y_samples,
 };
 
 /// アニメーションで操作できるシミュレーションパラメータ。
@@ -89,10 +90,12 @@ pub struct VisualSimulation {
     pub x: f64,
     pub y: f64,
     pub phi: f64,
-    pub target_x: f64,
+    pub target_right_x: f64,
+    pub target_left_x: f64,
     pub t: f64,
     pub steps: u64,
     pub first_passed: bool,
+    pub pass_direction: i32,
     pub completed: bool,
     rng: SplitMixRng,
     wall_y: Vec<f64>,
@@ -124,10 +127,12 @@ impl VisualSimulation {
             x: x0,
             y: y0,
             phi: phi0,
-            target_x: x0 + 1.0,
+            target_right_x: x0 + 1.0,
+            target_left_x: x0 - 1.0,
             t: 0.0,
             steps: 0,
             first_passed: false,
+            pass_direction: PASS_DIRECTION_NONE,
             completed: false,
             rng,
             wall_y: wall_y_samples(),
@@ -218,11 +223,22 @@ impl VisualSimulation {
         self.steps += 1;
         self.t = self.steps as f64 * DT;
 
-        if !self.first_passed && self.x > self.target_x {
-            self.first_passed = true;
+        if !self.first_passed {
+            self.record_first_passage();
         }
         if self.steps >= DEFAULT_MAX_STEPS {
             self.completed = true;
+        }
+    }
+
+    /// 現在の重心位置が x_0 ± L のどちらへ1周期分通過したかを記録する。
+    fn record_first_passage(&mut self) {
+        if self.x > self.target_right_x {
+            self.first_passed = true;
+            self.pass_direction = PASS_DIRECTION_RIGHT;
+        } else if self.x < self.target_left_x {
+            self.first_passed = true;
+            self.pass_direction = PASS_DIRECTION_LEFT;
         }
     }
 
@@ -457,12 +473,26 @@ mod tests {
 
     /// x_0 + L 通過後も最大ステップ到達までは完了扱いにしないことを確認する。
     #[test]
-    fn visual_simulation_keeps_running_after_first_passage() {
+    fn visual_simulation_records_right_first_passage() {
         let mut sim = VisualSimulation::new(VisualParams::default());
-        sim.x = sim.target_x + 0.01;
+        sim.x = sim.target_right_x + 0.01;
         sim.step_many(1);
 
         assert!(sim.first_passed);
+        assert_eq!(sim.pass_direction, PASS_DIRECTION_RIGHT);
+        assert!(!sim.completed);
+        assert_eq!(sim.steps, 1);
+    }
+
+    /// x_0 - L 側へ通過した場合も初通過として方向を保存することを確認する。
+    #[test]
+    fn visual_simulation_records_left_first_passage() {
+        let mut sim = VisualSimulation::new(VisualParams::default());
+        sim.x = sim.target_left_x - 0.01;
+        sim.step_many(1);
+
+        assert!(sim.first_passed);
+        assert_eq!(sim.pass_direction, PASS_DIRECTION_LEFT);
         assert!(!sim.completed);
         assert_eq!(sim.steps, 1);
     }

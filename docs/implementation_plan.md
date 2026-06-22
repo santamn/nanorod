@@ -159,22 +159,23 @@ curand_init(seed, global_trial_id, 0, &rng_state[trial_id])
 
 ### 6. 初通過判定
 
-初期化時に `target_x = x0 + 1` を保存する。各 step の更新後に
+初期化時に `target_right_x = x0 + 1` と `target_left_x = x0 - 1` を保存する。各 step の更新後に
 
 ```text
-x > target_x
+x > target_right_x または x < target_left_x
 ```
 
-となった最初の step を初通過とする。線形補間は行わず、その step 末の時刻、座標、状態をそのまま記録する。
+となった最初の step を初通過とし、右側なら `right`、左側なら `left` として通過方向を記録する。線形補間は行わず、その step 末の時刻、座標、状態をそのまま記録する。
 
 ```text
 T = (step + 1) * dt
 x_end = x
 y_end = y
 phi_end = phi
+pass_direction = right | left
 ```
 
-同一 trial では最初に `x > target_x` となった時点で `status = ok` とし、その後の更新は行わない。
+同一 trial では最初に左右どちらかの target を越えた時点で `status = ok` とし、その後の更新は行わない。
 
 ### 7. 長時間試行の扱い
 
@@ -194,10 +195,10 @@ phi_end = phi
 
 ```text
 combo_id,trial_id,device_id,m,l,beta_pE,delta_alpha_E_over_p,f,
-x0,y0,phi0,x_end,y_end,phi_end,T,steps,status
+x0,y0,phi0,x_end,y_end,phi_end,T,steps,status,pass_direction
 ```
 
-ここでは仕様確認のため、初期状態、終了状態、各 trial の初通過時間 `T` を必ず出力する。writer は少なくとも 100 trial ごと、または GPU worker から batch result を受け取るたびに flush する。
+ここでは仕様確認のため、初期状態、終了状態、各 trial の初通過時間 `T` と通過方向を必ず出力する。writer は少なくとも 100 trial ごと、または GPU worker から batch result を受け取るたびに flush する。
 
 `smoke_summary.csv` は同じ組み合わせの集計を 1 行で出力する。
 
@@ -209,7 +210,7 @@ production simulation の主出力は `summary.csv` のみとする。各 trial 
 
 ```text
 combo_id,device_id,m,l,beta_pE,delta_alpha_E_over_p,f,
-n_total,n_ok,n_max_steps,T1,T2,v,D_eff,dt,sigma,epsilon,seed
+n_total,n_ok,n_right_passes,n_left_passes,n_max_steps,passage_fraction,T1,T2,v,D_eff,dt,sigma,epsilon,seed
 ```
 
 `T1 = mean(T)`, `T2 = mean(T*T)`, `v = 1/T1`, `D_eff = 0.5 * (T2 - T1*T1) / (T1*T1*T1)` とする。

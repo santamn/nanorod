@@ -66,6 +66,9 @@ pub struct Cli {
     pub smoke_combo_id: usize,
 
     #[arg(long)]
+    pub smoke_m: Option<i32>,
+
+    #[arg(long)]
     pub combo_limit: Option<usize>,
 
     #[arg(long, default_value_t = 0)]
@@ -161,6 +164,25 @@ pub fn production_parameter_combinations(
     Ok(combos)
 }
 
+/// smoke run で使う1つのパラメータ組み合わせを選び、必要なら棒の長さだけ差し替える。
+pub fn smoke_parameter_combination(
+    smoke_combo_id: usize,
+    smoke_m: Option<i32>,
+) -> anyhow::Result<SimParams> {
+    let combos = all_parameter_combinations();
+    let Some(mut params) = combos.get(smoke_combo_id).copied() else {
+        anyhow::bail!("smoke combo id {smoke_combo_id} is out of range");
+    };
+
+    if let Some(m) = smoke_m {
+        anyhow::ensure!((1..=30).contains(&m), "--smoke-m must be between 1 and 30");
+        params.m = m;
+        params.l = particle_length(m);
+    }
+
+    Ok(params)
+}
+
 /// architecture.md の制約に従い、GPU 0 を誤って使わないように検証する。
 pub fn validate_devices(devices: &[usize], allow_device_zero: bool) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -236,5 +258,16 @@ mod tests {
                 .to_string()
                 .contains("leaves no parameter combinations")
         );
+    }
+
+    /// smoke 専用の `m` 上書きが、本番掃引の組み合わせを増やさず棒長だけ変えることを確認する。
+    #[test]
+    fn smoke_parameters_can_override_m_without_changing_sweep() {
+        let params = smoke_parameter_combination(0, Some(3)).unwrap();
+
+        assert_eq!(params.combo_id, 0);
+        assert_eq!(params.m, 3);
+        assert_eq!(params.l, particle_length(3));
+        assert_eq!(all_parameter_combinations().len(), 3420);
     }
 }

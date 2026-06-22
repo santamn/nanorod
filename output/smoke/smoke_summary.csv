@@ -1,2 +1,0 @@
-combo_id,device_id,m,l,beta_pe,delta_alpha_e_over_p,f,n_total,n_ok,n_max_steps,T1,T2,v,D_eff,dt,sigma,epsilon,seed
-0,-1,1,0.0128,0.25,0.25,1.0,96,58,38,1.3325167379310345,7.529657201160245,0.7504596164042749,1.215979058640532,4e-7,0.008,2.0,1

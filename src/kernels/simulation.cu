@@ -384,10 +384,12 @@ extern "C" __global__ void init_trials_kernel(
     double *x,
     double *y,
     double *phi,
-    double *target_x,
+    double *target_right_x,
+    double *target_left_x,
     double *times,
     unsigned long long *steps,
     int *statuses,
+    int *pass_directions,
     int n_trials)
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -416,10 +418,12 @@ extern "C" __global__ void init_trials_kernel(
   x[i] = x0;
   y[i] = y0;
   phi[i] = phi0;
-  target_x[i] = x0 + 1.0;
+  target_right_x[i] = x0 + 1.0;
+  target_left_x[i] = x0 - 1.0;
   times[i] = 0.0;
   steps[i] = 0ULL;
   statuses[i] = 0;
+  pass_directions[i] = 0;
 }
 
 // 未完了trialを固定ステップ数だけ進め、初通過またはmax_steps到達を記録する。
@@ -431,10 +435,12 @@ extern "C" __global__ void simulate_kernel(
     double *x,
     double *y,
     double *phi,
-    const double *target_x,
+    const double *target_right_x,
+    const double *target_left_x,
     double *times,
     unsigned long long *steps,
     int *statuses,
+    int *pass_directions,
     unsigned long long *counters,
     int n_trials,
     unsigned int steps_per_launch,
@@ -520,10 +526,18 @@ extern "C" __global__ void simulate_kernel(
     step_count += 1ULL;
     double ti = static_cast<double>(step_count) * params.dt;
 
-    // 補間はせず、初めて x > x0 + 1 になったステップ末の状態を記録する。
-    if (xi > target_x[i])
+    // 補間はせず、初めて x0 ± 1 のどちらかへ到達したステップ末の状態を記録する。
+    if (xi > target_right_x[i])
     {
       status = 1;
+      pass_directions[i] = 1;
+      times[i] = ti;
+      break;
+    }
+    if (xi < target_left_x[i])
+    {
+      status = 1;
+      pass_directions[i] = -1;
       times[i] = ti;
       break;
     }

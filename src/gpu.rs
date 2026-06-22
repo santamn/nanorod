@@ -184,10 +184,12 @@ where
     let mut x = stream.alloc_zeros::<f64>(work.trial_count)?;
     let mut y = stream.alloc_zeros::<f64>(work.trial_count)?;
     let mut phi = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut target_x = stream.alloc_zeros::<f64>(work.trial_count)?;
+    let mut target_right_x = stream.alloc_zeros::<f64>(work.trial_count)?;
+    let mut target_left_x = stream.alloc_zeros::<f64>(work.trial_count)?;
     let mut times = stream.alloc_zeros::<f64>(work.trial_count)?;
     let mut steps = stream.alloc_zeros::<u64>(work.trial_count)?;
     let mut statuses = stream.alloc_zeros::<i32>(work.trial_count)?;
+    let mut pass_directions = stream.alloc_zeros::<i32>(work.trial_count)?;
     let mut counters = stream.alloc_zeros::<u64>(2)?;
 
     let cfg = launch_config_for_trials(work.trial_count);
@@ -212,10 +214,12 @@ where
     init.arg(&mut x);
     init.arg(&mut y);
     init.arg(&mut phi);
-    init.arg(&mut target_x);
+    init.arg(&mut target_right_x);
+    init.arg(&mut target_left_x);
     init.arg(&mut times);
     init.arg(&mut steps);
     init.arg(&mut statuses);
+    init.arg(&mut pass_directions);
     init.arg(&n_trials_i32);
     unsafe { init.launch(cfg) }?;
 
@@ -231,10 +235,12 @@ where
         step_kernel.arg(&mut x);
         step_kernel.arg(&mut y);
         step_kernel.arg(&mut phi);
-        step_kernel.arg(&target_x);
+        step_kernel.arg(&target_right_x);
+        step_kernel.arg(&target_left_x);
         step_kernel.arg(&mut times);
         step_kernel.arg(&mut steps);
         step_kernel.arg(&mut statuses);
+        step_kernel.arg(&mut pass_directions);
         step_kernel.arg(&mut counters);
         step_kernel.arg(&n_trials_i32);
         step_kernel.arg(&config.steps_per_launch);
@@ -274,7 +280,8 @@ where
     stream.synchronize()?;
     let host_times = stream.clone_dtoh(&times)?;
     let host_statuses = stream.clone_dtoh(&statuses)?;
-    // production では summary に必要な T と status だけを戻す。
+    let host_pass_directions = stream.clone_dtoh(&pass_directions)?;
+    // production では summary に必要な T・status・通過方向だけを戻す。
     let summary = summarize_trials(
         config.device_id,
         work.params,
@@ -282,6 +289,7 @@ where
         config.seed,
         &host_times,
         &host_statuses,
+        &host_pass_directions,
     );
 
     let trials = if config.capture_trials {
@@ -309,6 +317,7 @@ where
                 t: host_times[idx],
                 steps: host_steps[idx],
                 status: host_statuses[idx],
+                pass_direction: host_pass_directions[idx],
             })
             .collect()
     } else {
