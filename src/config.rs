@@ -9,6 +9,8 @@ pub const SIGMA: f64 = 8.0e-3;
 pub const DT: f64 = 4.0e-7;
 pub const WALL_DX: f64 = 0.25 * SIGMA;
 pub const PARTICLE_DX: f64 = 0.8 * SIGMA;
+/// 全ての棒長で同じ時間スケールを使うため、D_0 の計算にだけ使う基準棒長。
+pub const DIFFUSION_REFERENCE_LENGTH: f64 = 6.0 * PARTICLE_DX;
 pub const N_WALL: usize = (L_PERIOD / WALL_DX) as usize;
 pub const WALL_K: i32 = 5;
 pub const MAX_WALL_REPULSION_FORCE: f64 = 2.5e4;
@@ -200,6 +202,13 @@ mod tests {
             assert_eq!(2 * m + 1, points);
             assert_eq!(particle_length(m), 2.0 * f64::from(m) * 0.8 * SIGMA);
         }
+    }
+
+    /// D_0 の基準棒長が、全棒長で共有する 6 点間隔ぶんの長さになっていることを確認する。
+    #[test]
+    fn diffusion_reference_length_matches_channel_neck_scale() {
+        assert_eq!(DIFFUSION_REFERENCE_LENGTH, 6.0 * 0.8 * SIGMA);
+        assert!((DIFFUSION_REFERENCE_LENGTH - 0.0384).abs() < 1.0e-15);
     }
 
     /// 境界補正と反発力上限に使う数値安全用の共通定数を確認する。

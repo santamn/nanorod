@@ -1,8 +1,8 @@
 use serde::Serialize;
 
 use crate::config::{
-    BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, EPSILON, L_PERIOD, N_WALL, SIGMA, SimParams,
-    WALL_DX, WALL_K, particle_length,
+    BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, DIFFUSION_REFERENCE_LENGTH, EPSILON, L_PERIOD,
+    N_WALL, SIGMA, SimParams, WALL_DX, WALL_K, particle_length,
 };
 
 // CUDA kernel と共有する trial の状態コード。
@@ -10,7 +10,7 @@ pub const STATUS_RUNNING: i32 = 0;
 pub const STATUS_OK: i32 = 1;
 pub const STATUS_MAX_STEPS: i32 = 2;
 
-/// 無次元化された拡散係数。
+/// 基準長で固定した D_0 によって無次元化された拡散係数。
 ///
 /// `d_perp` は仕様書の簡略化に従い、Tirado の値ではなく `0.5 * d_parallel` を使う。
 #[derive(Clone, Copy, Debug)]
@@ -18,6 +18,15 @@ pub struct Diffusion {
     pub d_parallel: f64,
     pub d_perp: f64,
     pub d_r: f64,
+}
+
+/// Tirado and Garcia de la Torre の式で使うアスペクト比依存の補正項。
+#[derive(Clone, Copy, Debug)]
+struct TiradoTerms {
+    log_p: f64,
+    nu_parallel: f64,
+    delta_perp: f64,
+    denominator: f64,
 }
 
 /// GPU から回収した1試行分の詳細結果。
@@ -271,8 +280,8 @@ pub fn wall_y_samples() -> Vec<f64> {
     (0..N_WALL).map(|k| omega(k as f64 * WALL_DX)).collect()
 }
 
-/// Tirado and Garcia de la Torre の式から拡散係数を計算する。
-pub fn diffusion_for_length(l: f64) -> Diffusion {
+/// 棒長から Tirado and Garcia de la Torre の補正項を計算する。
+fn tirado_terms_for_length(l: f64) -> TiradoTerms {
     let p = 40.0 * l;
     let log_p = p.ln();
     let inv_p = 1.0 / p;
@@ -281,11 +290,27 @@ pub fn diffusion_for_length(l: f64) -> Diffusion {
     let nu_parallel = -0.207 + 0.980 * inv_p - 0.133 * inv_p2;
     let nu_perp = 0.839 + 0.185 * inv_p + 0.233 * inv_p2;
     let delta_perp = -0.630 + 0.917 * inv_p - 0.050 * inv_p2;
-    let denom = 3.0 * log_p + 2.0 * nu_parallel + nu_perp;
+    let denominator = 3.0 * log_p + 2.0 * nu_parallel + nu_perp;
 
-    let d_parallel = 4.0 * (log_p + nu_parallel) / denom;
+    TiradoTerms {
+        log_p,
+        nu_parallel,
+        delta_perp,
+        denominator,
+    }
+}
+
+/// Tirado and Garcia de la Torre の式から無次元化済み拡散係数を計算する。
+pub fn diffusion_for_length(l: f64) -> Diffusion {
+    let terms = tirado_terms_for_length(l);
+    let reference_terms = tirado_terms_for_length(DIFFUSION_REFERENCE_LENGTH);
+    let translational_scale = DIFFUSION_REFERENCE_LENGTH / l;
+
+    let d_parallel =
+        4.0 * translational_scale * (terms.log_p + terms.nu_parallel) / reference_terms.denominator;
     let d_perp = 0.5 * d_parallel;
-    let d_r = 24.0 / (l * l) * (log_p + delta_perp) / denom;
+    let d_r = 24.0 * DIFFUSION_REFERENCE_LENGTH * (terms.log_p + terms.delta_perp)
+        / (l * l * l * reference_terms.denominator);
 
     Diffusion {
         d_parallel,
@@ -511,5 +536,41 @@ mod tests {
             assert!(diffusion.d_perp.is_finite() && diffusion.d_perp > 0.0);
             assert!(diffusion.d_r.is_finite() && diffusion.d_r > 0.0);
         }
+    }
+
+    /// 基準長そのものでは、固定 D_0 の式が従来の同一棒長正規化と一致することを確認する。
+    #[test]
+    fn diffusion_at_reference_length_matches_same_length_normalization() {
+        let terms = tirado_terms_for_length(DIFFUSION_REFERENCE_LENGTH);
+        let diffusion = diffusion_for_length(DIFFUSION_REFERENCE_LENGTH);
+
+        let expected_parallel = 4.0 * (terms.log_p + terms.nu_parallel) / terms.denominator;
+        let expected_rotation = 24.0 / (DIFFUSION_REFERENCE_LENGTH * DIFFUSION_REFERENCE_LENGTH)
+            * (terms.log_p + terms.delta_perp)
+            / terms.denominator;
+
+        assert!((diffusion.d_parallel - expected_parallel).abs() < 1.0e-12);
+        assert!((diffusion.d_perp - 0.5 * expected_parallel).abs() < 1.0e-12);
+        assert!((diffusion.d_r - expected_rotation).abs() < 1.0e-9);
+    }
+
+    /// 基準長以外の棒でも、D_0 の分母だけは共通の基準棒長から取ることを確認する。
+    #[test]
+    fn diffusion_uses_shared_reference_length_for_non_reference_rods() {
+        let l = particle_length(1);
+        let terms = tirado_terms_for_length(l);
+        let reference_terms = tirado_terms_for_length(DIFFUSION_REFERENCE_LENGTH);
+        let diffusion = diffusion_for_length(l);
+
+        let expected_parallel =
+            4.0 * (DIFFUSION_REFERENCE_LENGTH / l) * (terms.log_p + terms.nu_parallel)
+                / reference_terms.denominator;
+        let expected_rotation =
+            24.0 * DIFFUSION_REFERENCE_LENGTH * (terms.log_p + terms.delta_perp)
+                / (l * l * l * reference_terms.denominator);
+
+        assert!((diffusion.d_parallel - expected_parallel).abs() < 1.0e-12);
+        assert!((diffusion.d_perp - 0.5 * expected_parallel).abs() < 1.0e-12);
+        assert!((diffusion.d_r - expected_rotation).abs() < 1.0e-9);
     }
 }

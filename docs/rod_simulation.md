@@ -84,27 +84,40 @@ $$
 
 ### 拡散係数
 
-Tirado and Garcia de la Torre の式を用いて、$\widetilde{\mathbb{D}}$ と $\widetilde{D}_r$ を次のように表すことができる。ただし、 $D_0=\dfrac{D_{X X}+D_{Y Y}}{2}$ としている。
+Tirado and Garcia de la Torre の式を用いて、$\widetilde{\mathbb{D}}$ と $\widetilde{D}_r$ を次のように表すことができる。ここで、標準となる拡散係数 $D_0$ は棒長ごとに変えず、基準長
 
 $$
-\tilde{D}_{\|}=\frac{D_{\|}}{D_0}=\frac{\frac{k_B T}{2 \pi \eta l}\left(\ln p+\nu_{\|}\right)}{\frac{k_B T}{8 \pi \eta l}\left(3 \ln p+2 \nu_{\|}+\nu_{\perp}\right)}=\frac{4\left(\ln p+\nu_{\|}\right)}{3 \ln p+2 \nu_{\|}+\nu_{\perp}}
+\tilde{l}_0 = 6 \times 0.8\sigma = 6 \times 0.8 \times 8\times 10^{-3} = 0.0384
+$$
+
+の棒について
+
+$$
+D_0=\frac{k_B T}{8 \pi \eta L\tilde{l}_0}\left(3 \ln p_0+2 \nu_{\|,0}+\nu_{\perp,0}\right),\qquad p_0=40\tilde{l}_0
+$$
+
+として定義する。この共通の $D_0$ で全ての棒長を無次元化することで、棒長ごとに時間スケールが変わらないようにする。
+
+$$
+\tilde{D}_{\|}(\tilde{l})=\frac{D_{\|}(\tilde{l})}{D_0}
+=\frac{4\tilde{l}_0}{\tilde{l}}\frac{\ln p+\nu_{\|}}{3 \ln p_0+2 \nu_{\|,0}+\nu_{\perp,0}}
 $$
 
 $$
-\tilde{D}_{\perp}=\frac{D_{\perp}}{D_0}=\frac{\frac{k_B T}{4 \pi \eta l}\left(\ln p+\nu_{\perp}\right)}{\frac{k_B T}{8 \pi \eta l}\left(3 \ln p+2 \nu_{\|}+\nu_{\perp}\right)}=\frac{2\left(\ln p+\nu_{\perp}\right)}{3 \ln p+2 \nu_{\|}+\nu_{\perp}}
+\tilde{D}_{\perp}(\tilde{l})=\frac{D_{\perp}(\tilde{l})}{D_0}
+=\frac{2\tilde{l}_0}{\tilde{l}}\frac{\ln p+\nu_{\perp}}{3 \ln p_0+2 \nu_{\|,0}+\nu_{\perp,0}}
 $$
 
 $$
 \begin{gathered}
-\widetilde{D}_r
-= D_r \times \frac{L^2}{D_0}
-&= \frac{\frac{3 k_B T}{\pi \eta l^3}\left(\ln p+\delta_{\perp}\right)}{\frac{k_B T}{8 \pi \eta l}\left(3 \ln p+2 \nu_{\|}+\nu_{\perp}\right)} L^2 \\
-&= \frac{24}{l^2} \frac{\ln p+\delta_{\perp}}{3 \ln p+2 \nu_{\|}+\nu_{\perp}} L^2 \\
-&= \frac{24}{\tilde{l}^2} \frac{\ln p+\delta_{\perp}}{3 \ln p+2 \nu_{\|}+\nu_{\perp}}
+\widetilde{D}_r(\tilde{l})
+= D_r(\tilde{l}) \times \frac{L^2}{D_0}
+&= \frac{24\tilde{l}_0}{\tilde{l}^3}
+\frac{\ln p+\delta_{\perp}}{3 \ln p_0+2 \nu_{\|,0}+\nu_{\perp,0}}
 \end{gathered}
 $$
 
-ただし、$p = \dfrac{l}{d}$ は棒の長さと太さの比を表す無次元量である。また、$\nu_{\|}, \nu_{\perp}, \delta_{\perp}$ はアスペクト比 $p$ の関数であり、次のように定義される。
+ただし、$p = \dfrac{l}{d}$ は棒の長さと太さの比を表す無次元量である。また、$\nu_{\|}, \nu_{\perp}, \delta_{\perp}$ はアスペクト比 $p$ の関数であり、$\nu_{\|,0}, \nu_{\perp,0}$ は $p_0$ における値である。これらは次のように定義される。
 
 $$\begin{aligned}
 \nu_{\|} &= -0.207 + \frac{0.980}{p} - \frac{0.133}{p^2} \\

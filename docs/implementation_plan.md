@@ -88,7 +88,14 @@ r_j = X + offset_j * n
 
 ### 2. 拡散係数
 
-各 `l` について `p = 40*l` とし、Tirado and Garcia de la Torre の式で `D_parallel` と `D_r` を計算する。仕様書の簡略化に従い、並進ノイズと `D_lab` では `D_perp = 0.5 * D_parallel` を使う。
+各 `l` について `p = 40*l` とし、Tirado and Garcia de la Torre の式で `D_parallel` と `D_r` を計算する。時間スケールを棒長ごとに変えないため、標準拡散係数 `D_0` は全ての棒長で `l_ref = 6 * 0.8 * sigma = 0.0384` から計算した値を使う。仕様書の簡略化に従い、並進ノイズと `D_lab` では `D_perp = 0.5 * D_parallel` を使う。
+
+```text
+p_ref = 40 * l_ref
+denom_ref = 3*ln(p_ref) + 2*nu_parallel(p_ref) + nu_perp(p_ref)
+D_parallel = 4 * (l_ref / l) * (ln(p) + nu_parallel(p)) / denom_ref
+D_r = 24 * l_ref * (ln(p) + delta_perp(p)) / (l^3 * denom_ref)
+```
 
 ```text
 D_lab(phi) = D_parallel / 4 * [[3 + cos(2phi), sin(2phi)],
