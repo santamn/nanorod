@@ -19,6 +19,9 @@ use model::{PASS_DIRECTION_LEFT, PASS_DIRECTION_RIGHT};
 const TRAIL_LIMIT: usize = 900; // 重心の軌跡を保持する最大点数
 const CHANNEL_Y_SPAN: f64 = 5.25;
 const STEPS_PER_FRAME: usize = 1_000; // 滑らかな描画を保つために毎フレーム進める固定ステップ数
+const CAMERA_FOLLOW_RATE: f64 = 8.0; // 粒子の横揺れを画面へ直接伝えないための追従速度
+const CAMERA_MAX_LAG: f64 = 0.8; // 強い外力でも粒子を画面中央付近に保つ最大遅れ
+const CAMERA_MAX_DT: f64 = 0.1; // フレーム停止後にカメラが急に飛ばないようにする時間刻み上限
 
 const JAPANESE_FONT_CANDIDATES: &[&str] = &[
     "/System/Library/Fonts/ヒラギノ角ゴシック W3.ttc",
@@ -56,6 +59,7 @@ fn main() -> eframe::Result {
 struct AnimationApp {
     controls: VisualParams,
     simulation: VisualSimulation,
+    camera: CameraFollow,
     running: bool,
     trail: Vec<Pos2>,
 }
@@ -68,11 +72,13 @@ impl AnimationApp {
 
         let controls = VisualParams::default();
         let simulation = VisualSimulation::new(controls);
+        let camera = CameraFollow::new(simulation.x);
         let trail = vec![pos2(simulation.x as f32, simulation.y as f32)];
 
         Self {
             controls,
             simulation,
+            camera,
             running: false,
             trail,
         }
@@ -81,6 +87,7 @@ impl AnimationApp {
     /// 現在の操作パラメータで粒子と軌跡を初期状態へ戻す。
     fn reset(&mut self) {
         self.simulation.reset(self.controls);
+        self.camera.reset(self.simulation.x);
         self.trail.clear();
         self.trail
             .push(pos2(self.simulation.x as f32, self.simulation.y as f32));
@@ -99,6 +106,8 @@ impl AnimationApp {
 
         self.simulation.step_many(STEPS_PER_FRAME);
         self.push_trail_point();
+        self.camera
+            .advance_toward(self.simulation.x, animation_dt(ctx));
 
         if self.simulation.completed {
             self.running = false;
@@ -230,8 +239,49 @@ impl eframe::App for AnimationApp {
             let available = ui.available_size();
             let (response, painter) = ui.allocate_painter(available, Sense::hover());
             let painter = painter.with_clip_rect(response.rect);
-            draw_simulation(&painter, response.rect, &self.simulation, &self.trail);
+            draw_simulation(
+                &painter,
+                response.rect,
+                self.camera.x(),
+                &self.simulation,
+                &self.trail,
+            );
         });
+    }
+}
+
+/// 横方向だけを粒子へゆっくり追従させるカメラ状態。
+#[derive(Clone, Copy, Debug)]
+struct CameraFollow {
+    x: f64,
+}
+
+impl CameraFollow {
+    /// 初期粒子位置を画面中心としてカメラを作る。
+    fn new(x: f64) -> Self {
+        Self { x }
+    }
+
+    /// パラメータ変更やリセット時に、残った遅れを消してカメラを初期位置へ戻す。
+    fn reset(&mut self, x: f64) {
+        self.x = x;
+    }
+
+    /// 指数平滑で目標位置へ近づき、急な横揺れを画面全体の揺れにしない。
+    fn advance_toward(&mut self, target_x: f64, dt: f64) {
+        let dt = dt.clamp(0.0, CAMERA_MAX_DT);
+        let lag = target_x - self.x;
+        if lag.abs() > CAMERA_MAX_LAG {
+            self.x = target_x - lag.signum() * CAMERA_MAX_LAG;
+        }
+
+        let alpha = 1.0 - (-CAMERA_FOLLOW_RATE * dt).exp();
+        self.x += (target_x - self.x) * alpha;
+    }
+
+    /// 描画に使う現在のカメラ中心 x 座標を返す。
+    fn x(&self) -> f64 {
+        self.x
     }
 }
 
@@ -286,6 +336,11 @@ fn configure_style(ctx: &egui::Context) {
     });
 }
 
+/// egui の安定化されたフレーム間隔を、カメラ平滑化で扱いやすい秒単位へ変換する。
+fn animation_dt(ctx: &egui::Context) -> f64 {
+    f64::from(ctx.input(|input| input.stable_dt)).min(CAMERA_MAX_DT)
+}
+
 /// `m` の隣に棒長 `l` を表示する短いラベルを作る。
 fn point_count_label(m: i32) -> String {
     let length = config::particle_length(m);
@@ -310,12 +365,12 @@ fn pass_direction_display(direction: i32) -> &'static str {
 fn draw_simulation(
     painter: &egui::Painter,
     rect: Rect,
+    camera_x: f64,
     simulation: &VisualSimulation,
     trail: &[Pos2],
 ) {
     painter.rect_filled(rect, 0.0, Color32::from_rgb(246, 250, 248));
 
-    let camera_x = simulation.x;
     let world = WorldView::new(rect, camera_x, 0.0, CHANNEL_Y_SPAN);
 
     draw_channel(painter, &world);
@@ -472,5 +527,31 @@ impl WorldView {
         let sx = self.origin.x + ((x - self.x_min) * self.scale) as f32;
         let sy = self.origin.y - ((y - self.y_min) * self.scale) as f32;
         pos2(sx, sy)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 追従カメラが粒子位置へ一気に飛ばず、途中までだけ近づくことを確認する。
+    #[test]
+    fn camera_follow_smooths_small_horizontal_motion() {
+        let mut camera = CameraFollow::new(0.0);
+
+        camera.advance_toward(1.0, 1.0 / 60.0);
+
+        assert!(camera.x() > 0.0);
+        assert!(camera.x() < 1.0);
+    }
+
+    /// 追従カメラが大きな移動でも粒子を見失わない範囲に遅れを制限することを確認する。
+    #[test]
+    fn camera_follow_limits_large_horizontal_lag() {
+        let mut camera = CameraFollow::new(0.0);
+
+        camera.advance_toward(10.0, 1.0 / 60.0);
+
+        assert!((10.0 - camera.x()).abs() <= CAMERA_MAX_LAG);
     }
 }
