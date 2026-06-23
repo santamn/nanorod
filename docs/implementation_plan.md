@@ -11,7 +11,7 @@
 - WCA 反発力は、仕様書通り `epsilon = 2`, `sigma = 8e-3`, `dt = 4e-7` を使う。
 - 壁点は `0.25*sigma = 0.002` 間隔で 1 周期 500 点、近傍探索は x 方向インデックスのみで `K = 5` の固定長候補に絞る。
 - 粒子長は `l = 2m * 0.8 * sigma` とし、`m = 1, 4, 8, 15, 30` の 5 通りを使う。
-- パラメータは `l` 5 通り、`beta*pE` 6 通り、`Delta alpha*E/p` 6 通り、外力 `f` 19 通りの合計 3420 組とする。
+- パラメータは `l` 5 通り、`beta*qE` 6 通り、`Delta alpha*E/(q*l)` 6 通り、外力 `f` 19 通りの合計 3420 組とする。
 - 各組み合わせにつき `N = 30000` 試行、合計 102,600,000 試行を処理する。
 - 1 試行あたりの最大ステップ数は `2.5e7` とする。`dt = 4e-7` なので最大シミュレーション時刻は `10` である。
 - CPU フォールバックは実装しない。GPU 初期化またはカーネル実行に失敗したら、その理由を出して停止する。
@@ -109,7 +109,7 @@ D_lab(phi) = D_parallel / 4 * [[3 + cos(2phi), sin(2phi)],
 ```text
 F = (f, 0) + average_j(f_rep_j)
 tau_rep = n cross sum_j(offset_j * f_rep_j)
-tau_E = beta_pE * cos(phi) * (1 + delta_alpha_E_over_p * sin(phi))
+tau_E = beta_qe * l * cos(phi) * (1 + delta_alpha_e_over_ql * sin(phi))
 
 dX = D_lab(phi) * F * dt
    + R(phi) * [sqrt(2*D_parallel*dt)*N1, sqrt(2*D_perp*dt)*N2]
@@ -189,12 +189,12 @@ pass_direction = right | left
 
 ### Smoke run
 
-実装後、production simulation の前に必ず 1 パラメータ組み合わせの小さな試行を実行する。既定では `m`, `beta*pE`, `Delta alpha*E/p`, `f` から 1 つずつ選んだ 1 組み合わせを使い、少数 trial を GPU 1, 2, 3 に分割する。最終 production simulation はユーザーが依頼するまで実行しない。
+実装後、production simulation の前に必ず 1 パラメータ組み合わせの小さな試行を実行する。既定では `m`, `beta*qE`, `Delta alpha*E/(q*l)`, `f` から 1 つずつ選んだ 1 組み合わせを使い、少数 trial を GPU 1, 2, 3 に分割する。最終 production simulation はユーザーが依頼するまで実行しない。
 
 `smoke_trials.csv` は各試行 1 行。
 
 ```text
-combo_id,trial_id,device_id,m,l,beta_pE,delta_alpha_E_over_p,f,
+combo_id,trial_id,device_id,m,l,beta_qe,delta_alpha_e_over_ql,f,
 x0,y0,phi0,x_end,y_end,phi_end,T,steps,status,pass_direction
 ```
 
@@ -209,7 +209,7 @@ production simulation の主出力は `summary.csv` のみとする。各 trial 
 各パラメータ組み合わせ 1 行。
 
 ```text
-combo_id,device_id,m,l,beta_pE,delta_alpha_E_over_p,f,
+combo_id,device_id,m,l,beta_qe,delta_alpha_e_over_ql,f,
 n_total,n_ok,n_right_passes,n_left_passes,n_max_steps,passage_fraction,T1,T2,v,D_eff,dt,sigma,epsilon,seed
 ```
 

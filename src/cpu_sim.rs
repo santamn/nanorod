@@ -15,8 +15,8 @@ pub struct VisualParams {
     pub seed: u64,
     pub m: i32,
     pub force: f64,
-    pub beta_pe: f64,
-    pub delta_alpha_e_over_p: f64,
+    pub beta_qe: f64,
+    pub delta_alpha_e_over_ql: f64,
 }
 
 impl Default for VisualParams {
@@ -26,8 +26,8 @@ impl Default for VisualParams {
             seed: 1,
             m: 8,
             force: 0.0,
-            beta_pe: 0.0,
-            delta_alpha_e_over_p: 0.0,
+            beta_qe: 0.0,
+            delta_alpha_e_over_ql: 0.0,
         }
     }
 }
@@ -39,8 +39,8 @@ impl VisualParams {
             combo_id: 0,
             m: self.m,
             l: particle_length(self.m),
-            beta_pe: self.beta_pe,
-            delta_alpha_e_over_p: self.delta_alpha_e_over_p,
+            beta_qe: self.beta_qe,
+            delta_alpha_e_over_ql: self.delta_alpha_e_over_ql,
             force: self.force,
         }
     }
@@ -295,7 +295,10 @@ impl VisualSimulation {
             torque_sum += offset * (c * force_y - s * force_x);
         }
 
-        let tau_e = self.params.beta_pe * c * (1.0 + self.params.delta_alpha_e_over_p * s);
+        let tau_e = self.params.beta_qe
+            * particle_length(self.params.m)
+            * c
+            * (1.0 + self.params.delta_alpha_e_over_ql * s);
 
         GeneralizedForce {
             force_x: self.params.force + rep_sum_x,
@@ -460,8 +463,8 @@ mod tests {
         let mut sim = VisualSimulation::new(VisualParams {
             m: 20,
             force: 100.0,
-            beta_pe: 0.0,
-            delta_alpha_e_over_p: 0.0,
+            beta_qe: 0.0,
+            delta_alpha_e_over_ql: 0.0,
             ..VisualParams::default()
         });
 
@@ -517,14 +520,31 @@ mod tests {
             let sim = VisualSimulation::new(VisualParams {
                 m,
                 force: 7.0,
-                beta_pe: 0.0,
-                delta_alpha_e_over_p: 0.0,
+                beta_qe: 0.0,
+                delta_alpha_e_over_ql: 0.0,
                 ..VisualParams::default()
             });
             let force = sim.generalized_force_at(0.25, 0.0, 0.0);
 
             assert!((force.force_x - 7.0).abs() < 1.0e-12);
             assert!(force.force_y.abs() < 1.0e-12);
+        }
+    }
+
+    /// 電場トルクの永久双極子成分が `p = ql` に従って棒長に比例することを確認する。
+    #[test]
+    fn electric_torque_scales_with_particle_length() {
+        let beta_qe = 2.0;
+        for m in [1, 8, 30] {
+            let sim = VisualSimulation::new(VisualParams {
+                m,
+                beta_qe,
+                delta_alpha_e_over_ql: 0.0,
+                ..VisualParams::default()
+            });
+            let force = sim.generalized_force_at(0.25, 0.0, 0.0);
+
+            assert!((force.torque - beta_qe * particle_length(m)).abs() < 1.0e-12);
         }
     }
 

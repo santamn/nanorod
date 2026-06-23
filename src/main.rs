@@ -76,8 +76,8 @@ fn run_smoke(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> Resul
     let params = smoke_parameter_combination(
         cli.smoke_combo_id,
         cli.smoke_m,
-        cli.smoke_beta_pe,
-        cli.smoke_delta_alpha_e_over_p,
+        cli.smoke_beta_qe,
+        cli.smoke_delta_alpha_e_over_ql,
         cli.smoke_f,
     )?;
     let splits = split_trials(trial_count, cli.devices.len());

@@ -15,8 +15,8 @@ struct KernelParams
   int wall_k;
   int boundary_reflection_limit;
   double l;
-  double beta_pe;
-  double delta_alpha_e_over_p;
+  double beta_qe;
+  double delta_alpha_e_over_ql;
   double force;
   double d_parallel;
   double d_perp;
@@ -316,7 +316,7 @@ __device__ GeneralizedForce generalized_force_at(
     torque_sum += offset * (c * force_y - s * force_x);
   }
 
-  double tau_e = params.beta_pe * c * (1.0 + params.delta_alpha_e_over_p * s);
+  double tau_e = params.beta_qe * params.l * c * (1.0 + params.delta_alpha_e_over_ql * s);
 
   GeneralizedForce result;
   result.force_x = params.force + rep_sum_x;

@@ -23,10 +23,10 @@ $$
 \bm{F} = \bm{f} + \sum_{j=-m}^m \bm{f}^{\text{rep}}_j
 $$
 
-また、トルク $\tau$ は電気双極子が電場から受ける作用によって生まれるトルク $\tau_{\bm{E}}(\phi)$ と、[壁からの反発力によって生まれるトルク](#電場によるトルクの計算) $\tau^{\text{rep}}$ の和に分けられる。ここで、 $l$ は粒子の長軸方向の長さである。
+また、トルク $\tau$ は電気双極子が電場から受ける作用によって生まれるトルク $\tau_{\bm{E}}(\phi)$ と、[壁からの反発力によって生まれるトルク](#電場によるトルクの計算) $\tau^{\text{rep}}$ の和に分けられる。ここで、 $l$ は粒子の長軸方向の長さであり、永久双極子モーメントの大きさは棒長に比例するとして $p = ql$ とおく。
 
 $$
-\tau = \tau^{\text{rep}} + \tau_{\bm{E}}(\phi) = \dfrac{l}{2m}\bm{n} \times \left( \sum_{k=1}^m k\left(\bm{f}_k^{\text{rep}} - \bm{f}_{-k}^{\text{rep}} \right)\right) + pE\cos\phi(1+\frac{\Delta\alpha E}{p}\sin\phi)
+\tau = \tau^{\text{rep}} + \tau_{\bm{E}}(\phi) = \dfrac{l}{2m}\bm{n} \times \left( \sum_{k=1}^m k\left(\bm{f}_k^{\text{rep}} - \bm{f}_{-k}^{\text{rep}} \right)\right) + qlE\cos\phi\left(1+\frac{\Delta\alpha E}{ql}\sin\phi\right)
 $$
 
 また、$\bm{\xi}(t)$ と $\xi_r(t)$ はそれぞれ位置と回転に対するガウス白色雑音である。これらの雑音は平均がゼロであると仮定されており、その共分散は次のように表される。
@@ -59,7 +59,7 @@ $$\begin{aligned}
 \widetilde{\mathbb{D}} = \dfrac{\mathbb{D}}{D_0},& \ 
 \widetilde{D_r} = \dfrac{D_r}{\frac{D_0}{L^2}} \\
 \widetilde{\tau}_{\text{rep}} = \beta\tau_{\text{rep}} &= \dfrac{\tilde{l}}{2m}\bm{n} \times \left(\sum_{k=1}^m k\left(\widetilde{\bm{f}}_k^{\text{rep}} - \widetilde{\bm{f}}_{-k}^{\text{rep}} \right)\right) \\
-\widetilde{\tau}_E = \beta\tau_E &= \beta pE\cos\phi(1+\Delta\alpha\frac{E}{p}\sin\phi)\\
+\widetilde{\tau}_E = \beta\tau_E &= \beta qE\tilde{l}\cos\phi\left(1+\Delta\alpha\frac{E}{ql}\sin\phi\right)\\
 \bm{\widetilde{\xi}}(t) = \frac{L}{D_0}{\bm{\xi}}(t),& \quad
 \widetilde{\xi}_r(t) = \frac{L^2}{D_0}{\xi}_r(t)
 \end{aligned}$$
@@ -314,11 +314,11 @@ l = 2\times 0.8\sigma \ (代表点3個, m = 1) &,\ 8\times 0.8\sigma \ (代表�
 \end{align*}$$
 
 $$
-\beta pE = \frac{1}{4}, \frac{1}{2}, \frac{3}{4}, 1, \frac{3}{2}, 2
+\beta qE = \frac{1}{4}, \frac{1}{2}, \frac{3}{4}, 1, \frac{3}{2}, 2
 $$
 
 $$
-\Delta\alpha\frac{E}{p} = \frac{1}{4}, \frac{1}{2}, \frac{3}{4}, 1, \frac{3}{2}, 2
+\Delta\alpha\frac{E}{ql} = \frac{1}{4}, \frac{1}{2}, \frac{3}{4}, 1, \frac{3}{2}, 2
 $$
 
 各シミュレーションにおいて、 $x$ 軸方向へ一定にかける粒子全体への合力 $\bm{f} = f\bm{e}_x$ は次のパターンで変化させる。
@@ -330,14 +330,14 @@ $$
 
 この時、必ず以下を記録に残すこと。
 
-- 定数の値 $(l, \beta pE, \Delta\alpha\frac{E}{p}, f)$
+- 定数の値 $(l, \beta qE, \Delta\alpha\frac{E}{ql}, f)$
 - 各定数の組み合わせに対する $T$ の平均 $T_1$ と 2乗の平均 $T_2$、及び $T_1$ と $T_2$ から求めた平均速度 $v$ と有効拡散係数 $D_{\text{eff}}$
 
 ## 資料
 
 ### 電場によるトルクの計算
 
-トルク $\tau_{\bm{E}}$ は電気双極子が電場から受ける作用によって生まれるものであるから、電場 $\bm{E}$ のもとでの電気双極子のエネルギー $U_{\bm{E}}$ を用いて、$\tau_{\bm{E}} = -\frac{\partial}{\partial \Phi}U_{\bm{E}}$ と表される。今考えている粒子の永久双極子モーメントを $\bm{p}$ 、分極テンソルを $\hat{\alpha}$ とすると、電気双極子のエネルギーは
+トルク $\tau_{\bm{E}}$ は電気双極子が電場から受ける作用によって生まれるものであるから、電場 $\bm{E}$ のもとでの電気双極子のエネルギー $U_{\bm{E}}$ を用いて、$\tau_{\bm{E}} = -\frac{\partial}{\partial \Phi}U_{\bm{E}}$ と表される。今考えている粒子の永久双極子モーメントを $\bm{p}=ql\bm{n}$ 、分極テンソルを $\hat{\alpha}$ とすると、電気双極子のエネルギーは
 
 $$ U_{\bm{E}} = -\bm{p}\cdot\bm{E} - \frac{1}{2}\bm{E}^\top\hat{\alpha}\bm{E} $$
 
@@ -347,14 +347,14 @@ $$ U_{\bm{E}} = -\bm{p}\cdot\bm{E} - \frac{1}{2}\alpha_{\perp}|\bm{E}|^2 - \frac
 
 $\bm{n} = \left(\begin{array}{l}\cos\phi \\ \sin\phi\end{array}\right),\ \bm{E} = \left(\begin{array}{l}0 \\ E\end{array}\right)$ と設定すると
 
-$$ U_{\bm{E}}(\phi) = -pE\sin\phi - \frac{E^2}{2}\alpha_{\perp} - \frac{E^2}{2}(\alpha_{\parallel} - \alpha_{\perp})\sin^2\phi $$
+$$ U_{\bm{E}}(\phi) = -qlE\sin\phi - \frac{E^2}{2}\alpha_{\perp} - \frac{E^2}{2}(\alpha_{\parallel} - \alpha_{\perp})\sin^2\phi $$
 
 より
 
 $$\begin{aligned}
 \tau_{\bm{E}}(\phi) &= -\frac{\partial}{\partial \phi}U_{\bm{E}}(\phi) \\
-&= pE\cos\phi + \Delta\alpha E^2\sin \phi\cos \phi \\
-&= pE\cos\phi(1+\Delta\alpha\frac{E}{p}\sin\phi)
+&= qlE\cos\phi + \Delta\alpha E^2\sin \phi\cos \phi \\
+&= qlE\cos\phi\left(1+\Delta\alpha\frac{E}{ql}\sin\phi\right)
 \end{aligned}$$
 
-ここで $\Delta\alpha \coloneqq \alpha_{\parallel} - \alpha_{\perp},\ \bm{p} = p\bm{n}$ である。
+ここで $\Delta\alpha \coloneqq \alpha_{\parallel} - \alpha_{\perp},\ \bm{p} = ql\bm{n}$ である。

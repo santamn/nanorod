@@ -23,8 +23,8 @@ pub const DEFAULT_SMOKE_TRIALS: usize = 96;
 
 // rod_simulation.md にある全パラメータ掃引の値。
 pub const M_VALUES: [i32; 5] = [1, 4, 8, 15, 30];
-pub const BETA_PE_VALUES: [f64; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
-pub const DELTA_ALPHA_E_OVER_P_VALUES: [f64; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
+pub const BETA_QE_VALUES: [f64; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
+pub const DELTA_ALPHA_E_OVER_QL_VALUES: [f64; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
 pub const FORCE_VALUES: [f64; 19] = [
     1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
     90.0, 100.0,
@@ -69,10 +69,10 @@ pub struct Cli {
     pub smoke_m: Option<i32>,
 
     #[arg(long)]
-    pub smoke_beta_pe: Option<f64>,
+    pub smoke_beta_qe: Option<f64>,
 
     #[arg(long)]
-    pub smoke_delta_alpha_e_over_p: Option<f64>,
+    pub smoke_delta_alpha_e_over_ql: Option<f64>,
 
     #[arg(long = "smoke-f", alias = "smoke-force")]
     pub smoke_f: Option<f64>,
@@ -110,8 +110,8 @@ pub struct SimParams {
     pub combo_id: u32,
     pub m: i32,
     pub l: f64,
-    pub beta_pe: f64,
-    pub delta_alpha_e_over_p: f64,
+    pub beta_qe: f64,
+    pub delta_alpha_e_over_ql: f64,
     pub force: f64,
 }
 
@@ -124,21 +124,21 @@ pub fn particle_length(m: i32) -> f64 {
 pub fn all_parameter_combinations() -> Vec<SimParams> {
     let mut combos = Vec::with_capacity(
         M_VALUES.len()
-            * BETA_PE_VALUES.len()
-            * DELTA_ALPHA_E_OVER_P_VALUES.len()
+            * BETA_QE_VALUES.len()
+            * DELTA_ALPHA_E_OVER_QL_VALUES.len()
             * FORCE_VALUES.len(),
     );
 
     for &m in &M_VALUES {
-        for &beta_pe in &BETA_PE_VALUES {
-            for &delta_alpha_e_over_p in &DELTA_ALPHA_E_OVER_P_VALUES {
+        for &beta_qe in &BETA_QE_VALUES {
+            for &delta_alpha_e_over_ql in &DELTA_ALPHA_E_OVER_QL_VALUES {
                 for &force in &FORCE_VALUES {
                     combos.push(SimParams {
                         combo_id: combos.len() as u32,
                         m,
                         l: particle_length(m),
-                        beta_pe,
-                        delta_alpha_e_over_p,
+                        beta_qe,
+                        delta_alpha_e_over_ql,
                         force,
                     });
                 }
@@ -177,8 +177,8 @@ pub fn production_parameter_combinations(
 pub fn smoke_parameter_combination(
     smoke_combo_id: usize,
     smoke_m: Option<i32>,
-    smoke_beta_pe: Option<f64>,
-    smoke_delta_alpha_e_over_p: Option<f64>,
+    smoke_beta_qe: Option<f64>,
+    smoke_delta_alpha_e_over_ql: Option<f64>,
     smoke_f: Option<f64>,
 ) -> anyhow::Result<SimParams> {
     let combos = all_parameter_combinations();
@@ -192,14 +192,14 @@ pub fn smoke_parameter_combination(
         params.l = particle_length(m);
     }
 
-    if let Some(beta_pe) = smoke_beta_pe {
-        ensure_finite_smoke_override("smoke-beta-pe", beta_pe)?;
-        params.beta_pe = beta_pe;
+    if let Some(beta_qe) = smoke_beta_qe {
+        ensure_finite_smoke_override("smoke-beta-qe", beta_qe)?;
+        params.beta_qe = beta_qe;
     }
 
-    if let Some(delta_alpha_e_over_p) = smoke_delta_alpha_e_over_p {
-        ensure_finite_smoke_override("smoke-delta-alpha-e-over-p", delta_alpha_e_over_p)?;
-        params.delta_alpha_e_over_p = delta_alpha_e_over_p;
+    if let Some(delta_alpha_e_over_ql) = smoke_delta_alpha_e_over_ql {
+        ensure_finite_smoke_override("smoke-delta-alpha-e-over-ql", delta_alpha_e_over_ql)?;
+        params.delta_alpha_e_over_ql = delta_alpha_e_over_ql;
     }
 
     if let Some(force) = smoke_f {
@@ -313,8 +313,8 @@ mod tests {
         assert_eq!(params.combo_id, 0);
         assert_eq!(params.m, 3);
         assert_eq!(params.l, particle_length(3));
-        assert_eq!(params.beta_pe, 1.0);
-        assert_eq!(params.delta_alpha_e_over_p, 0.0);
+        assert_eq!(params.beta_qe, 1.0);
+        assert_eq!(params.delta_alpha_e_over_ql, 0.0);
         assert_eq!(params.force, 0.0);
         assert_eq!(all_parameter_combinations().len(), 3420);
     }
@@ -324,6 +324,6 @@ mod tests {
     fn smoke_parameters_reject_non_finite_overrides() {
         let error = smoke_parameter_combination(0, None, Some(f64::NAN), None, None).unwrap_err();
 
-        assert!(error.to_string().contains("--smoke-beta-pe must be finite"));
+        assert!(error.to_string().contains("--smoke-beta-qe must be finite"));
     }
 }
