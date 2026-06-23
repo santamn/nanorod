@@ -69,6 +69,15 @@ pub struct Cli {
     pub smoke_m: Option<i32>,
 
     #[arg(long)]
+    pub smoke_beta_pe: Option<f64>,
+
+    #[arg(long)]
+    pub smoke_delta_alpha_e_over_p: Option<f64>,
+
+    #[arg(long = "smoke-f", alias = "smoke-force")]
+    pub smoke_f: Option<f64>,
+
+    #[arg(long)]
     pub combo_limit: Option<usize>,
 
     #[arg(long, default_value_t = 0)]
@@ -164,10 +173,13 @@ pub fn production_parameter_combinations(
     Ok(combos)
 }
 
-/// smoke run で使う1つのパラメータ組み合わせを選び、必要なら棒の長さだけ差し替える。
+/// smoke run で使う1つのパラメータ組み合わせを選び、必要なら物理量を差し替える。
 pub fn smoke_parameter_combination(
     smoke_combo_id: usize,
     smoke_m: Option<i32>,
+    smoke_beta_pe: Option<f64>,
+    smoke_delta_alpha_e_over_p: Option<f64>,
+    smoke_f: Option<f64>,
 ) -> anyhow::Result<SimParams> {
     let combos = all_parameter_combinations();
     let Some(mut params) = combos.get(smoke_combo_id).copied() else {
@@ -180,7 +192,28 @@ pub fn smoke_parameter_combination(
         params.l = particle_length(m);
     }
 
+    if let Some(beta_pe) = smoke_beta_pe {
+        ensure_finite_smoke_override("smoke-beta-pe", beta_pe)?;
+        params.beta_pe = beta_pe;
+    }
+
+    if let Some(delta_alpha_e_over_p) = smoke_delta_alpha_e_over_p {
+        ensure_finite_smoke_override("smoke-delta-alpha-e-over-p", delta_alpha_e_over_p)?;
+        params.delta_alpha_e_over_p = delta_alpha_e_over_p;
+    }
+
+    if let Some(force) = smoke_f {
+        ensure_finite_smoke_override("smoke-f", force)?;
+        params.force = force;
+    }
+
     Ok(params)
+}
+
+/// smoke 専用上書き値に NaN や無限大が混ざらないことを確認する。
+fn ensure_finite_smoke_override(name: &str, value: f64) -> anyhow::Result<()> {
+    anyhow::ensure!(value.is_finite(), "--{} must be finite", name);
+    Ok(())
 }
 
 /// architecture.md の制約に従い、GPU 0 を誤って使わないように検証する。
@@ -263,11 +296,34 @@ mod tests {
     /// smoke 専用の `m` 上書きが、本番掃引の組み合わせを増やさず棒長だけ変えることを確認する。
     #[test]
     fn smoke_parameters_can_override_m_without_changing_sweep() {
-        let params = smoke_parameter_combination(0, Some(3)).unwrap();
+        let params = smoke_parameter_combination(0, Some(3), None, None, None).unwrap();
 
         assert_eq!(params.combo_id, 0);
         assert_eq!(params.m, 3);
         assert_eq!(params.l, particle_length(3));
         assert_eq!(all_parameter_combinations().len(), 3420);
+    }
+
+    /// smoke 専用の物理量上書きが、0を含む任意の有限値を受け付けることを確認する。
+    #[test]
+    fn smoke_parameters_can_override_physical_values() {
+        let params =
+            smoke_parameter_combination(0, Some(3), Some(1.0), Some(0.0), Some(0.0)).unwrap();
+
+        assert_eq!(params.combo_id, 0);
+        assert_eq!(params.m, 3);
+        assert_eq!(params.l, particle_length(3));
+        assert_eq!(params.beta_pe, 1.0);
+        assert_eq!(params.delta_alpha_e_over_p, 0.0);
+        assert_eq!(params.force, 0.0);
+        assert_eq!(all_parameter_combinations().len(), 3420);
+    }
+
+    /// smoke 専用の物理量上書きで非有限値を弾けることを確認する。
+    #[test]
+    fn smoke_parameters_reject_non_finite_overrides() {
+        let error = smoke_parameter_combination(0, None, Some(f64::NAN), None, None).unwrap_err();
+
+        assert!(error.to_string().contains("--smoke-beta-pe must be finite"));
     }
 }

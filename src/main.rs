@@ -73,7 +73,13 @@ fn create_new_output_dir(path: &Path) -> Result<()> {
 ///
 /// trial 詳細を出力し、GPU 1,2,3 へ trial を分割して multi-GPU 経路も確認する。
 fn run_smoke(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> Result<()> {
-    let params = smoke_parameter_combination(cli.smoke_combo_id, cli.smoke_m)?;
+    let params = smoke_parameter_combination(
+        cli.smoke_combo_id,
+        cli.smoke_m,
+        cli.smoke_beta_pe,
+        cli.smoke_delta_alpha_e_over_p,
+        cli.smoke_f,
+    )?;
     let splits = split_trials(trial_count, cli.devices.len());
     create_new_output_dir(&cli.output_dir)?;
 
