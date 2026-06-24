@@ -89,6 +89,13 @@ pub struct Cli {
     #[arg(long, default_value_t = 10_000)]
     pub steps_per_launch: u32,
 
+    /// production で各 GPU が同時並行に処理する combo 数（=CUDA stream 数）。
+    ///
+    /// N=1000 では1 combo が A100 の数 SM しか使わないため、複数 combo を
+    /// 並行させて占有率を上げる。約16でA100が飽和する（measured knee）。
+    #[arg(long, default_value_t = 16)]
+    pub streams: usize,
+
     #[arg(long, default_value_t = 1)]
     pub seed: u64,
 

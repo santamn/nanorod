@@ -205,44 +205,35 @@ fn run_production(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> 
         );
 
         thread::spawn(move || {
-            loop {
-                let Some(params) = next_work(&worker_queue) else {
-                    let _ = worker_tx.send(WorkerMessage::WorkerDone { device_id });
-                    return;
-                };
-
-                let work = ComboWork {
-                    params,
-                    trial_count,
-                    trial_offset: 0,
-                };
-                let result = gpu::run_combo(&config, work, |progress| {
+            // 1 GPU 上で num_streams 本の combo を同時並行に処理し、queue を空にする。
+            let result = gpu::run_device_streamed(
+                &config,
+                trial_count,
+                || next_work(&worker_queue),
+                |progress| {
                     let _ = worker_tx.send(WorkerMessage::Progress(progress_row(
                         &config,
                         &progress,
                         worker_completed.load(Ordering::Relaxed),
                         total_combos,
                     )));
-                });
+                },
+                |output| {
+                    // 完了順に summary を返す。JSON 側では combo_id で対応できる。
+                    worker_completed.fetch_add(1, Ordering::Relaxed);
+                    let _ = worker_tx.send(WorkerMessage::ComboFinished(output));
+                },
+            );
 
-                match result {
-                    Ok(output) => {
-                        // 完了順に summary を返す。JSON側では combo_id で対応できる。
-                        worker_completed.fetch_add(1, Ordering::Relaxed);
-                        if worker_tx
-                            .send(WorkerMessage::ComboFinished(output))
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        let _ = worker_tx.send(WorkerMessage::WorkerError {
-                            device_id,
-                            message: format!("{error:#}"),
-                        });
-                        return;
-                    }
+            match result {
+                Ok(()) => {
+                    let _ = worker_tx.send(WorkerMessage::WorkerDone { device_id });
+                }
+                Err(error) => {
+                    let _ = worker_tx.send(WorkerMessage::WorkerError {
+                        device_id,
+                        message: format!("{error:#}"),
+                    });
                 }
             }
         });
@@ -307,6 +298,7 @@ fn worker_config(
         seed: cli.seed,
         max_steps: cli.max_steps,
         steps_per_launch: cli.steps_per_launch,
+        num_streams: cli.streams,
         cuda_include_paths: include_paths,
         cuda_arch: cli.cuda_arch.clone(),
         capture_trials,
