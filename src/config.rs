@@ -32,7 +32,7 @@ pub const DEFAULT_HIST_STRIDE: u32 = 100;
 
 /// コマンドライン引数。
 ///
-/// 掃引するパラメータ（m, f, βqE, ΔαE/(qL)）はリストで与え、それらの直積を
+/// 掃引するパラメータ（m, f, βpE, |Δα|E/p）はリストで与え、それらの直積を
 /// combo として実行する。各 combo の結果は `output_dir` の下の専用フォルダへ保存する。
 #[derive(Debug, Parser)]
 #[command(
@@ -60,13 +60,16 @@ pub struct Cli {
     #[arg(long = "f", value_delimiter = ',', value_parser = parse_ratio, required = true)]
     pub f: Vec<f64>,
 
-    /// βqE のリスト。`1/3` のような分数も受け付ける。
-    #[arg(long = "beta-qe", value_delimiter = ',', value_parser = parse_ratio, required = true)]
-    pub beta_qe: Vec<f64>,
+    /// βpE（双極子モーメント p = ql を含む電場結合の大きさ）のリスト。`1/3` のような分数も受け付ける。
+    #[arg(long = "beta-pe", value_delimiter = ',', value_parser = parse_ratio, required = true)]
+    pub beta_pe: Vec<f64>,
 
-    /// ΔαE/(qL) のリスト。`1/3` のような分数も受け付ける。
-    #[arg(long = "delta-alpha-e-over-ql", value_delimiter = ',', value_parser = parse_ratio, required = true)]
-    pub delta_alpha_e_over_ql: Vec<f64>,
+    /// |Δα|E/p（電場トルクの異方性成分と永久双極子成分の比）のリスト。`1/3` のような分数も受け付ける。
+    ///
+    /// 補足資料 式(8) の形 τ_E = βpE·cosφ·(1 − (|Δα|E/p)·sinφ) で用い、正の値ほど棒を
+    /// y 軸から横へ倒す効果が強くなる（1 を超えると傾いた配向が安定になる）。
+    #[arg(long = "abs-delta-alpha-e-over-p", value_delimiter = ',', value_parser = parse_ratio, required = true)]
+    pub abs_delta_alpha_e_over_p: Vec<f64>,
 
     #[arg(long, default_value_t = DEFAULT_MAX_STEPS)]
     pub max_steps: u64,
@@ -136,8 +139,10 @@ pub struct SimParams {
     pub combo_id: u32,
     pub m: i32,
     pub l: f64,
-    pub beta_qe: f64,
-    pub delta_alpha_e_over_ql: f64,
+    /// 電場トルクの永久双極子成分の大きさ βpE（= pE、p = ql）。トルクに直接掛かる係数。
+    pub beta_pe: f64,
+    /// 電場トルクの異方性成分と永久双極子成分の比 |Δα|E/p。正で棒を横へ倒す効果を生む。
+    pub abs_delta_alpha_e_over_p: f64,
     pub force: f64,
 }
 
@@ -148,12 +153,12 @@ pub fn particle_length(m: i32) -> f64 {
 
 /// CLI で与えられた各パラメータのリストから、その直積を combo として列挙する。
 ///
-/// 列挙順は m → βqE → ΔαE/(qL) → f の入れ子で、`combo_id` を 0 から振り直す。
+/// 列挙順は m → βpE → |Δα|E/p → f の入れ子で、`combo_id` を 0 から振り直す。
 /// 同じ値が重複して与えられても、combo が二重にならないよう各リストを重複排除する。
 pub fn parameter_combinations(
     m_values: &[i32],
-    beta_qe_values: &[f64],
-    delta_alpha_e_over_ql_values: &[f64],
+    beta_pe_values: &[f64],
+    abs_delta_alpha_e_over_p_values: &[f64],
     force_values: &[f64],
 ) -> anyhow::Result<Vec<SimParams>> {
     for &m in m_values {
@@ -161,24 +166,24 @@ pub fn parameter_combinations(
     }
 
     let m_values = dedup_in_order_i32(m_values);
-    let beta_qe_values = dedup_in_order_f64(beta_qe_values);
-    let delta_values = dedup_in_order_f64(delta_alpha_e_over_ql_values);
+    let beta_pe_values = dedup_in_order_f64(beta_pe_values);
+    let delta_values = dedup_in_order_f64(abs_delta_alpha_e_over_p_values);
     let force_values = dedup_in_order_f64(force_values);
 
     let mut combos = Vec::with_capacity(
-        m_values.len() * beta_qe_values.len() * delta_values.len() * force_values.len(),
+        m_values.len() * beta_pe_values.len() * delta_values.len() * force_values.len(),
     );
 
     for &m in &m_values {
-        for &beta_qe in &beta_qe_values {
-            for &delta_alpha_e_over_ql in &delta_values {
+        for &beta_pe in &beta_pe_values {
+            for &abs_delta_alpha_e_over_p in &delta_values {
                 for &force in &force_values {
                     combos.push(SimParams {
                         combo_id: combos.len() as u32,
                         m,
                         l: particle_length(m),
-                        beta_qe,
-                        delta_alpha_e_over_ql,
+                        beta_pe,
+                        abs_delta_alpha_e_over_p,
                         force,
                     });
                 }
@@ -196,8 +201,8 @@ pub fn combo_dir_name(params: &SimParams) -> String {
         "m{}_f{}_beta{}_delta{}",
         params.m,
         format_param(params.force),
-        format_param(params.beta_qe),
-        format_param(params.delta_alpha_e_over_ql),
+        format_param(params.beta_pe),
+        format_param(params.abs_delta_alpha_e_over_p),
     )
 }
 
@@ -288,8 +293,8 @@ mod tests {
             combo_id: 0,
             m: 3,
             l: particle_length(3),
-            beta_qe: 1.0,
-            delta_alpha_e_over_ql: 0.5,
+            beta_pe: 1.0,
+            abs_delta_alpha_e_over_p: 0.5,
             force: 0.0,
         };
         assert_eq!(combo_dir_name(&params), "m3_f0_beta1_delta0.5");

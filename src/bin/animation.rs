@@ -182,12 +182,12 @@ impl eframe::App for AnimationApp {
                     .add(egui::Slider::new(&mut self.controls.force, 0.0..=100.0).text("f"))
                     .changed();
                 params_changed |= ui
-                    .add(egui::Slider::new(&mut self.controls.beta_qe, -5.0..=5.0).text("βqE"))
+                    .add(egui::Slider::new(&mut self.controls.beta_pe, -5.0..=5.0).text("βpE"))
                     .changed();
                 params_changed |= ui
                     .add(
-                        egui::Slider::new(&mut self.controls.delta_alpha_e_over_ql, -5.0..=5.0)
-                            .text("ΔαE/(ql)"),
+                        egui::Slider::new(&mut self.controls.abs_delta_alpha_e_over_p, 0.0..=5.0)
+                            .text("|Δα|E/p"),
                     )
                     .changed();
 

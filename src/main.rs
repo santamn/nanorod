@@ -42,7 +42,7 @@ fn main() -> Result<()> {
         "--steps-per-launch must be greater than zero"
     );
 
-    let combos = parameter_combinations(&cli.m, &cli.beta_qe, &cli.delta_alpha_e_over_ql, &cli.f)?;
+    let combos = parameter_combinations(&cli.m, &cli.beta_pe, &cli.abs_delta_alpha_e_over_p, &cli.f)?;
     run(&cli, combos, include_paths)
 }
 

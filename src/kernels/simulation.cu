@@ -15,8 +15,8 @@ struct KernelParams
   int wall_k;
   int boundary_reflection_limit;
   double l;
-  double beta_qe;
-  double delta_alpha_e_over_ql;
+  double beta_pe;
+  double abs_delta_alpha_e_over_p;
   double force;
   double d_parallel;
   double d_perp;
@@ -320,7 +320,9 @@ __device__ GeneralizedForce generalized_force_at(
     torque_sum += offset * (c * force_y - s * force_x);
   }
 
-  double tau_e = params.beta_qe * params.l * c * (1.0 + params.delta_alpha_e_over_ql * s);
+  // 補足資料 式(8) の形 τ_E = βpE·cosφ·(1 − (|Δα|E/p)·sinφ)。
+  // βpE は p = ql を含む電場結合の大きさそのもの（l は掛けない）。|Δα|E/p は正で横倒し効果を生む。
+  double tau_e = params.beta_pe * c * (1.0 - params.abs_delta_alpha_e_over_p * s);
 
   GeneralizedForce result;
   result.force_x = params.force + rep_sum_x;

@@ -22,8 +22,8 @@ cargo build --release --features gpu
 cargo run --release --features gpu -- \
   --m 1,4,8 \
   --f 1,2,5,10 \
-  --beta-qe 0.25,0.5,1.0 \
-  --delta-alpha-e-over-ql 0.5,1.0
+  --beta-pe 0.25,0.5,1.0 \
+  --abs-delta-alpha-e-over-p 0.5,2.0
 ```
 
 上の例では `3 × 4 × 3 × 2 = 72` combo を実行する。
@@ -31,14 +31,14 @@ cargo run --release --features gpu -- \
 ### パラメータ
 
 これらは必須で、それぞれカンマ区切りのリストとして与える。
-`f`・`beta-qe`・`delta-alpha-e-over-ql` は `1/3` のような分数表記も使える。
+`f`・`beta-pe`・`abs-delta-alpha-e-over-p` は `1/3` のような分数表記も使える。
 
 | オプション | 意味 |
 | :--- | :--- |
 | `--m <M,...>` | 棒の片側代表点数 m のリスト（棒長は `l = 2m * 0.8σ`）。m ≥ 1 の整数。 |
 | `--f <F,...>` | 駆動力 f のリスト。例: `--f 1,2,1/3` |
-| `--beta-qe <B,...>` | βqE のリスト。例: `--beta-qe 0.5,1/3` |
-| `--delta-alpha-e-over-ql <D,...>` | ΔαE/(qL) のリスト。 |
+| `--beta-pe <B,...>` | βpE（双極子モーメント p = ql を含む電場結合の大きさ）のリスト。電場トルクに直接掛かる係数で、棒長 l に依らない。例: `--beta-pe 0.5,1/3` |
+| `--abs-delta-alpha-e-over-p <D,...>` | \|Δα\|E/p（電場トルクの異方性成分と永久双極子成分の比）のリスト。トルクは補足資料 式(8) の `τ_E = βpE·cosφ·(1 − (\|Δα\|E/p)·sinφ)` で、正の値ほど棒を y 軸から横へ倒す効果が強くなる（1 を超えると傾いた配向が安定）。例: `--abs-delta-alpha-e-over-p 1,2,3` |
 
 同じ値を重複して与えても、combo は重複しないよう自動的に1つにまとめられる。
 
