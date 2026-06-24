@@ -13,7 +13,8 @@ use crate::config::{
     WALL_K,
 };
 use crate::model::{
-    SummaryRow, TrialResult, diffusion_for_length, summarize_trials, wall_y_samples,
+    STATUS_RUNNING, SummaryRow, TrialResult, diffusion_for_length, summarize_trials,
+    wall_y_samples,
 };
 
 const KERNEL_SRC: &str = include_str!("kernels/simulation.cu");
@@ -104,14 +105,14 @@ pub struct GpuRunConfig {
     pub progress_interval: Duration,
 }
 
-/// 1 combo の GPU 実行結果。
+/// 1 combo の集計結果。
 ///
+/// trial 詳細は完了ごとに別経路（`on_trials`）で流すため、ここには含めない。
 /// `hist_phi` は (x × φ)、`hist_y` は (x × y) の2Dヒストグラムを、x を最外として
 /// 行優先で平坦化したもの。
 #[derive(Debug)]
 pub struct ComboOutput {
     pub summary: SummaryRow,
-    pub trials: Vec<TrialResult>,
     pub hist_phi: Vec<u64>,
     pub hist_y: Vec<u64>,
 }
@@ -178,6 +179,10 @@ struct StreamSlot {
     hist_phi: CudaSlice<u64>,
     hist_y: CudaSlice<u64>,
     job: Option<SlotJob>,
+    /// trial index ごとに、確定結果を既に host へ流したか。combo ごとに `start_job` で戻す。
+    emitted: Vec<bool>,
+    /// `emitted` のうち true の数。新たに完了した trial の有無を counters と比べて判定する。
+    emitted_count: usize,
 }
 
 impl StreamSlot {
@@ -220,6 +225,8 @@ impl StreamSlot {
             hist_phi,
             hist_y,
             job: None,
+            emitted: vec![false; trial_count],
+            emitted_count: 0,
         })
     }
 
@@ -245,6 +252,10 @@ impl StreamSlot {
         stream.memset_zeros(&mut self.counters)?;
         stream.memset_zeros(&mut self.hist_phi)?;
         stream.memset_zeros(&mut self.hist_y)?;
+
+        // 前の combo の「出力済み」印も戻し、新しい combo を最初から数え直す。
+        self.emitted.fill(false);
+        self.emitted_count = 0;
 
         {
             let mut setup = stream.launch_builder(setup_rng);
@@ -328,6 +339,57 @@ impl StreamSlot {
         job.launched_steps = job.launched_steps.saturating_add(u64::from(steps_per_launch));
         Ok(())
     }
+
+    /// まだ出力していない trial のうち、完了したもの（`emit_all` 時は残り全て）の確定結果を
+    /// host へ回収し、`emitted` に印を付けて返す。
+    ///
+    /// 完了した trial は kernel が以降スキップするため、初期状態・終了状態とも確定済みで、
+    /// 途中の chunk で読み出しても値は変わらない。`times`・`statuses`・`pass_directions` は
+    /// 呼び出し側が既に回収済みのものを使い回す。
+    fn collect_unemitted(
+        &mut self,
+        device_id: usize,
+        params: SimParams,
+        emit_all: bool,
+        host_times: &[f64],
+        host_statuses: &[i32],
+        host_pass_directions: &[i32],
+    ) -> Result<Vec<TrialResult>> {
+        let host_x0 = self.stream.clone_dtoh(&self.x0)?;
+        let host_y0 = self.stream.clone_dtoh(&self.y0)?;
+        let host_phi0 = self.stream.clone_dtoh(&self.phi0)?;
+        let host_x = self.stream.clone_dtoh(&self.x)?;
+        let host_y = self.stream.clone_dtoh(&self.y)?;
+        let host_phi = self.stream.clone_dtoh(&self.phi)?;
+        let host_steps = self.stream.clone_dtoh(&self.steps)?;
+
+        let mut rows = Vec::new();
+        for idx in 0..host_statuses.len() {
+            // 既に流した trial と、（最終回でなければ）まだ走行中の trial は飛ばす。
+            if self.emitted[idx] || (!emit_all && host_statuses[idx] == STATUS_RUNNING) {
+                continue;
+            }
+            self.emitted[idx] = true;
+            self.emitted_count += 1;
+            rows.push(TrialResult {
+                combo_id: params.combo_id,
+                trial_id: idx as u64,
+                device_id,
+                params,
+                x0: host_x0[idx],
+                y0: host_y0[idx],
+                phi0: host_phi0[idx],
+                x_end: host_x[idx],
+                y_end: host_y[idx],
+                phi_end: host_phi[idx],
+                t: host_times[idx],
+                steps: host_steps[idx],
+                status: host_statuses[idx],
+                pass_direction: host_pass_directions[idx],
+            });
+        }
+        Ok(rows)
+    }
 }
 
 /// 1 GPU 上で複数 combo を CUDA stream で同時並行に処理し、queue を空にする。
@@ -337,17 +399,22 @@ impl StreamSlot {
 /// combo が完了した stream はすぐ次の combo を queue から取り直すので、遅い combo が
 /// GPU 全体を遊ばせ続けることもない。
 ///
+/// 完了した trial は chunk ごとに `on_trials` で逐次流し、combo 全体の集計（summary・
+/// ヒストグラム）は完了時に `on_finished` で1度だけ流す。
+///
 /// `next_params` が `None` を返したら新規割り当てを止め、実行中の combo を全て見送って終了する。
-pub fn run_device_streamed<FNext, FProgress, FFinished>(
+pub fn run_device_streamed<FNext, FProgress, FTrials, FFinished>(
     config: &GpuRunConfig,
     trial_count: usize,
     mut next_params: FNext,
     mut on_progress: FProgress,
+    mut on_trials: FTrials,
     mut on_finished: FFinished,
 ) -> Result<()>
 where
     FNext: FnMut() -> Option<SimParams>,
     FProgress: FnMut(GpuProgress),
+    FTrials: FnMut(Vec<TrialResult>),
     FFinished: FnMut(ComboOutput),
 {
     anyhow::ensure!(trial_count > 0, "trial_count must be positive");
@@ -443,11 +510,46 @@ where
                 slot.job.as_mut().expect("active slot").last_progress = Instant::now();
             }
 
+            // この chunk で新たに完了した trial があれば、確定した行をすぐ回収して流す。
+            // counters は完了 trial 数なので、出力済み数を超えたぶんだけ読み出せばよい。
+            if !done && completed > slot.emitted_count {
+                let host_times = slot.stream.clone_dtoh(&slot.times)?;
+                let host_statuses = slot.stream.clone_dtoh(&slot.statuses)?;
+                let host_pass_directions = slot.stream.clone_dtoh(&slot.pass_directions)?;
+                let params = slot.job.as_ref().expect("active slot").params;
+                let rows = slot.collect_unemitted(
+                    config.device_id,
+                    params,
+                    false,
+                    &host_times,
+                    &host_statuses,
+                    &host_pass_directions,
+                )?;
+                if !rows.is_empty() {
+                    on_trials(rows);
+                }
+            }
+
             if done {
                 let host_times = slot.stream.clone_dtoh(&slot.times)?;
                 let host_statuses = slot.stream.clone_dtoh(&slot.statuses)?;
                 let host_pass_directions = slot.stream.clone_dtoh(&slot.pass_directions)?;
                 let params = slot.job.as_ref().expect("active slot").params;
+
+                // max_steps で未通過のまま終わった trial など、まだ出していない行を出し切る。
+                // summary より先に流して、集計確定までに全 trial 行が書き終わるようにする。
+                let rows = slot.collect_unemitted(
+                    config.device_id,
+                    params,
+                    true,
+                    &host_times,
+                    &host_statuses,
+                    &host_pass_directions,
+                )?;
+                if !rows.is_empty() {
+                    on_trials(rows);
+                }
+
                 let summary = summarize_trials(
                     config.device_id,
                     params,
@@ -457,20 +559,10 @@ where
                     &host_statuses,
                     &host_pass_directions,
                 );
-                let trials = capture_trials(
-                    slot,
-                    config.device_id,
-                    params,
-                    trial_count,
-                    &host_times,
-                    &host_statuses,
-                    &host_pass_directions,
-                )?;
                 let hist_phi = slot.stream.clone_dtoh(&slot.hist_phi)?;
                 let hist_y = slot.stream.clone_dtoh(&slot.hist_y)?;
                 on_finished(ComboOutput {
                     summary,
-                    trials,
                     hist_phi,
                     hist_y,
                 });
@@ -495,46 +587,6 @@ where
     }
 
     Ok(())
-}
-
-/// 完了した combo の各 trial の初期状態・終了状態を host へ回収し、詳細結果にまとめる。
-///
-/// `times`・`statuses`・`pass_directions` は呼び出し側が既に回収済みのものを使い回す。
-fn capture_trials(
-    slot: &StreamSlot,
-    device_id: usize,
-    params: SimParams,
-    trial_count: usize,
-    host_times: &[f64],
-    host_statuses: &[i32],
-    host_pass_directions: &[i32],
-) -> Result<Vec<TrialResult>> {
-    let host_x0 = slot.stream.clone_dtoh(&slot.x0)?;
-    let host_y0 = slot.stream.clone_dtoh(&slot.y0)?;
-    let host_phi0 = slot.stream.clone_dtoh(&slot.phi0)?;
-    let host_x = slot.stream.clone_dtoh(&slot.x)?;
-    let host_y = slot.stream.clone_dtoh(&slot.y)?;
-    let host_phi = slot.stream.clone_dtoh(&slot.phi)?;
-    let host_steps = slot.stream.clone_dtoh(&slot.steps)?;
-
-    Ok((0..trial_count)
-        .map(|idx| TrialResult {
-            combo_id: params.combo_id,
-            trial_id: idx as u64,
-            device_id,
-            params,
-            x0: host_x0[idx],
-            y0: host_y0[idx],
-            phi0: host_phi0[idx],
-            x_end: host_x[idx],
-            y_end: host_y[idx],
-            phi_end: host_phi[idx],
-            t: host_times[idx],
-            steps: host_steps[idx],
-            status: host_statuses[idx],
-            pass_direction: host_pass_directions[idx],
-        })
-        .collect())
 }
 
 /// CUDA C ソースを実行時に PTX へコンパイルする。

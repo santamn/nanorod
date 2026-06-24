@@ -2,6 +2,7 @@ mod config;
 mod gpu;
 mod model;
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, create_dir, create_dir_all};
 use std::io::{BufWriter, Write};
@@ -18,11 +19,13 @@ use config::{
     parameter_combinations, validate_devices,
 };
 use gpu::{ComboOutput, GpuProgress, GpuRunConfig};
-use model::ProgressRow;
+use model::{ProgressRow, TrialResult};
 
 /// GPU worker から main thread へ送るメッセージ。
 enum WorkerMessage {
     Progress(ProgressRow),
+    /// 完了した trial の確定行。1 メッセージは1 combo 分。
+    TrialsReady(Vec<TrialResult>),
     ComboFinished(ComboOutput),
     WorkerDone { device_id: usize },
     WorkerError { device_id: usize, message: String },
@@ -113,6 +116,9 @@ fn run(cli: &Cli, combos: Vec<SimParams>, include_paths: Vec<String>) -> Result<
                         total_combos,
                     )));
                 },
+                |trials| {
+                    let _ = worker_tx.send(WorkerMessage::TrialsReady(trials));
+                },
                 |output| {
                     worker_completed.fetch_add(1, Ordering::Relaxed);
                     let _ = worker_tx.send(WorkerMessage::ComboFinished(output));
@@ -137,6 +143,9 @@ fn run(cli: &Cli, combos: Vec<SimParams>, include_paths: Vec<String>) -> Result<
     let mut completed_workers = 0usize;
     let mut errors = Vec::<String>::new();
 
+    // combo ごとに trials.csv を開いたまま保持し、完了した trial を逐次追記する。
+    let mut trial_writers = HashMap::<u32, csv::Writer<File>>::new();
+
     // 出力は main thread に集約し、複数 worker から同じファイルへ直接書かない。
     while completed_workers < cli.devices.len() {
         match rx.recv()? {
@@ -154,7 +163,14 @@ fn run(cli: &Cli, combos: Vec<SimParams>, include_paths: Vec<String>) -> Result<
                 );
                 write_progress(&mut progress_writer, &row)?;
             }
+            WorkerMessage::TrialsReady(trials) => {
+                append_trials(&mut trial_writers, &combo_dirs, &trials)?;
+            }
             WorkerMessage::ComboFinished(output) => {
+                // 逐次追記してきた trials.csv を flush して閉じてから、残りを書き出す。
+                if let Some(mut writer) = trial_writers.remove(&output.summary.combo_id) {
+                    writer.flush()?;
+                }
                 write_combo_output(&combo_dirs, &output)?;
             }
             WorkerMessage::WorkerDone { device_id } => {
@@ -180,17 +196,42 @@ fn run(cli: &Cli, combos: Vec<SimParams>, include_paths: Vec<String>) -> Result<
     Ok(())
 }
 
-/// 1 combo の trial 詳細と summary を、その combo 専用フォルダへ書き出す。
+/// 完了した trial の確定行を、その combo の trials.csv へ追記する。
+///
+/// 1 メッセージは1 combo 分なので、対応する writer を開いたまま使い回し（ヘッダは初回のみ）、
+/// バッチごとに flush して完了した trial を逐次ディスクへ反映する。
+fn append_trials(
+    writers: &mut HashMap<u32, csv::Writer<File>>,
+    combo_dirs: &HashMap<u32, PathBuf>,
+    trials: &[TrialResult],
+) -> Result<()> {
+    for trial in trials {
+        let writer = match writers.entry(trial.combo_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let dir = combo_dirs
+                    .get(&trial.combo_id)
+                    .with_context(|| format!("no output directory for combo {}", trial.combo_id))?;
+                entry.insert(csv::Writer::from_path(dir.join("trials.csv"))?)
+            }
+        };
+        writer.serialize(trial.to_csv_row())?;
+    }
+
+    // バッチは1 combo 分なので、その writer を flush すれば完了ぶんが即ディスクへ出る。
+    if let Some(writer) = trials.first().and_then(|first| writers.get_mut(&first.combo_id)) {
+        writer.flush()?;
+    }
+    Ok(())
+}
+
+/// 1 combo の summary とヒストグラムを、その combo 専用フォルダへ書き出す。
+///
+/// trial 詳細（trials.csv）は完了ごとに `append_trials` で逐次追記済みなので、ここでは扱わない。
 fn write_combo_output(combo_dirs: &HashMap<u32, PathBuf>, output: &ComboOutput) -> Result<()> {
     let dir = combo_dirs
         .get(&output.summary.combo_id)
         .with_context(|| format!("no output directory for combo {}", output.summary.combo_id))?;
-
-    let mut trial_writer = csv::Writer::from_path(dir.join("trials.csv"))?;
-    for trial in &output.trials {
-        trial_writer.serialize(trial.to_csv_row())?;
-    }
-    trial_writer.flush()?;
 
     write_json_object(&dir.join("summary.json"), &output.summary)?;
 
