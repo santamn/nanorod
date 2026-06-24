@@ -2,10 +2,10 @@ mod config;
 mod gpu;
 mod model;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{File, create_dir, create_dir_all};
 use std::io::{BufWriter, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -14,11 +14,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, anyhow};
 use clap::Parser;
 use config::{
-    Cli, RunMode, SimParams, production_parameter_combinations, smoke_parameter_combination,
-    validate_devices,
+    Cli, HIST_PHI_BINS, HIST_X_BINS, HIST_Y_BINS, HIST_Y_MAX, SimParams, combo_dir_name,
+    parameter_combinations, validate_devices,
 };
-use gpu::{ComboOutput, ComboWork, GpuProgress, GpuRunConfig};
-use model::{ProgressRow, SummaryRow, aggregate_summaries};
+use gpu::{ComboOutput, GpuProgress, GpuRunConfig};
+use model::ProgressRow;
 
 /// GPU worker から main thread へ送るメッセージ。
 enum WorkerMessage {
@@ -31,24 +31,22 @@ enum WorkerMessage {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     model::validate_static_geometry()?;
-    validate_devices(&cli.devices, cli.allow_device_zero)?;
+    validate_devices(&cli.devices)?;
 
     let include_paths = gpu::cuda_include_paths(&cli.cuda_include_path);
-    let trial_count = gpu::trial_count_for_mode(cli.mode, cli.trials);
-    // 0 step や 0 trial はGPU kernelの進捗判定を壊すため、CLI入口で弾く。
-    anyhow::ensure!(trial_count > 0, "--trials must be greater than zero");
+    // 0 trial / 0 step はGPU kernelの進捗判定を壊すため、CLI入口で弾く。
+    anyhow::ensure!(cli.trials > 0, "--trials must be greater than zero");
     anyhow::ensure!(cli.max_steps > 0, "--max-steps must be greater than zero");
     anyhow::ensure!(
         cli.steps_per_launch > 0,
         "--steps-per-launch must be greater than zero"
     );
 
-    match cli.mode {
-        RunMode::Smoke => run_smoke(&cli, trial_count, include_paths),
-        RunMode::Production => run_production(&cli, trial_count, include_paths),
-    }
+    let combos = parameter_combinations(&cli.m, &cli.beta_qe, &cli.delta_alpha_e_over_ql, &cli.f)?;
+    run(&cli, combos, include_paths)
 }
 
+/// 上書き事故を避けるため、まだ存在しない出力ディレクトリだけを新規作成する。
 fn create_new_output_dir(path: &Path) -> Result<()> {
     if path.exists() {
         anyhow::bail!(
@@ -69,140 +67,37 @@ fn create_new_output_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 1つのパラメータ組み合わせを少数 trial で確認する。
+/// 全パラメータ組み合わせを GPU で処理し、combo ごとのフォルダへ結果を保存する。
 ///
-/// trial 詳細を出力し、GPU 1,2,3 へ trial を分割して multi-GPU 経路も確認する。
-fn run_smoke(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> Result<()> {
-    let params = smoke_parameter_combination(
-        cli.smoke_combo_id,
-        cli.smoke_m,
-        cli.smoke_beta_qe,
-        cli.smoke_delta_alpha_e_over_ql,
-        cli.smoke_f,
-    )?;
-    let splits = split_trials(trial_count, cli.devices.len());
-    create_new_output_dir(&cli.output_dir)?;
-
-    let smoke_trials_path = cli.output_dir.join("smoke_trials.csv");
-    let smoke_summary_path = cli.output_dir.join("smoke_summary.json");
-    let progress_path = cli.output_dir.join("progress.jsonl");
-    let mut trial_writer = csv::Writer::from_path(&smoke_trials_path)?;
-    let mut progress_writer = BufWriter::new(File::create(&progress_path)?);
-
-    let (tx, rx) = mpsc::channel::<WorkerMessage>();
-    let mut active_workers = 0usize;
-    let mut trial_offset = 0_u64;
-
-    // smoke では同じ combo の trial を GPU ごとに分割する。
-    for (&device_id, count) in cli.devices.iter().zip(splits) {
-        if count == 0 {
-            continue;
-        }
-        active_workers += 1;
-        let worker_tx = tx.clone();
-        let config = worker_config(cli, device_id, true, include_paths.clone(), RunMode::Smoke);
-        let work = ComboWork {
-            params,
-            trial_count: count,
-            trial_offset,
-        };
-        trial_offset += count as u64;
-
-        thread::spawn(move || {
-            let result = gpu::run_combo(&config, work, |progress| {
-                let _ = worker_tx.send(WorkerMessage::Progress(progress_row(
-                    &config, &progress, 0, 1,
-                )));
-            });
-            send_worker_result(worker_tx, device_id, result);
-        });
-    }
-    drop(tx);
-
-    let mut completed_workers = 0usize;
-    let mut partial_summaries = Vec::<SummaryRow>::new();
-    let mut errors = Vec::<String>::new();
-
-    // main thread が writer を担当し、複数 worker から同じファイルへ直接書かない。
-    while completed_workers < active_workers {
-        match rx.recv()? {
-            WorkerMessage::Progress(row) => {
-                eprintln!(
-                    "[{}] gpu={} combo={} trials={}/{} steps={} status={}",
-                    row.run_mode,
-                    row.device_id,
-                    row.combo_id,
-                    row.completed_trials,
-                    row.total_trials,
-                    row.current_steps,
-                    row.status
-                );
-                write_progress(&mut progress_writer, &row)?;
-            }
-            WorkerMessage::ComboFinished(output) => {
-                // smoke は各 trial の初期状態・終了状態・初通過時間を保存する。
-                for trial in &output.trials {
-                    trial_writer.serialize(trial.to_csv_row())?;
-                }
-                trial_writer.flush()?;
-                partial_summaries.push(output.summary);
-            }
-            WorkerMessage::WorkerDone { device_id } => {
-                completed_workers += 1;
-                eprintln!("[smoke] gpu={device_id} done");
-            }
-            WorkerMessage::WorkerError { device_id, message } => {
-                completed_workers += 1;
-                errors.push(format!("gpu {device_id}: {message}"));
-            }
-        }
-    }
-
-    if !errors.is_empty() {
-        return Err(anyhow!(errors.join("; ")));
-    }
-
-    // GPU ごとの部分 summary を、smoke 全体の1行 summary にまとめる。
-    let aggregate = aggregate_summaries(-1, params, cli.seed, &partial_summaries);
-    write_json_object(&smoke_summary_path, &aggregate)?;
-
-    eprintln!(
-        "[smoke] wrote {} and {}",
-        smoke_trials_path.display(),
-        smoke_summary_path.display()
-    );
-    Ok(())
-}
-
-/// 全パラメータ組み合わせを処理する production run。
-///
-/// trial 詳細は保存せず、combo ごとの summary だけを逐次 flush する。
-fn run_production(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> Result<()> {
-    let combos = production_parameter_combinations(cli.combo_start, cli.combo_limit)?;
+/// 各 GPU worker が共有キューから combo を取り出して並行処理し、完了した combo の
+/// trial 詳細と summary を main thread が `output_dir/<combo>/` へ逐次書き出す。
+fn run(cli: &Cli, combos: Vec<SimParams>, include_paths: Vec<String>) -> Result<()> {
+    let trial_count = cli.trials;
     let total_combos = combos.len();
+
     create_new_output_dir(&cli.output_dir)?;
 
-    let summary_path = cli.output_dir.join("summary.json");
+    // combo ごとの出力フォルダを先に作り、combo_id から引けるようにしておく。
+    let mut combo_dirs = HashMap::<u32, PathBuf>::with_capacity(total_combos);
+    for params in &combos {
+        let dir = cli.output_dir.join(combo_dir_name(params));
+        create_dir(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        combo_dirs.insert(params.combo_id, dir);
+    }
+
     let progress_path = cli.output_dir.join("progress.jsonl");
-    let mut summary_writer = JsonArrayWriter::create(&summary_path)?;
     let mut progress_writer = BufWriter::new(File::create(&progress_path)?);
 
     let queue = Arc::new(Mutex::new(VecDeque::<SimParams>::from(combos)));
     let completed_combos = Arc::new(AtomicUsize::new(0));
     let (tx, rx) = mpsc::channel::<WorkerMessage>();
 
-    // 各GPU workerが共有キューから次のcomboを取り出す。
+    // 各 GPU worker が共有キューから次の combo を取り出す。
     for &device_id in &cli.devices {
         let worker_tx = tx.clone();
         let worker_queue = Arc::clone(&queue);
         let worker_completed = Arc::clone(&completed_combos);
-        let config = worker_config(
-            cli,
-            device_id,
-            false,
-            include_paths.clone(),
-            RunMode::Production,
-        );
+        let config = worker_config(cli, device_id, include_paths.clone());
 
         thread::spawn(move || {
             // 1 GPU 上で num_streams 本の combo を同時並行に処理し、queue を空にする。
@@ -219,7 +114,6 @@ fn run_production(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> 
                     )));
                 },
                 |output| {
-                    // 完了順に summary を返す。JSON 側では combo_id で対応できる。
                     worker_completed.fetch_add(1, Ordering::Relaxed);
                     let _ = worker_tx.send(WorkerMessage::ComboFinished(output));
                 },
@@ -243,13 +137,12 @@ fn run_production(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> 
     let mut completed_workers = 0usize;
     let mut errors = Vec::<String>::new();
 
-    // production でも writer はmain threadに集約し、1行ごとにflushする。
+    // 出力は main thread に集約し、複数 worker から同じファイルへ直接書かない。
     while completed_workers < cli.devices.len() {
         match rx.recv()? {
             WorkerMessage::Progress(row) => {
                 eprintln!(
-                    "[{}] gpu={} combo={} combos={}/{} trials={}/{} steps={} status={}",
-                    row.run_mode,
+                    "gpu={} combo={} combos={}/{} trials={}/{} steps={} status={}",
                     row.device_id,
                     row.combo_id,
                     row.completed_combos,
@@ -262,11 +155,11 @@ fn run_production(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> 
                 write_progress(&mut progress_writer, &row)?;
             }
             WorkerMessage::ComboFinished(output) => {
-                summary_writer.write_element(&output.summary)?;
+                write_combo_output(&combo_dirs, &output)?;
             }
             WorkerMessage::WorkerDone { device_id } => {
                 completed_workers += 1;
-                eprintln!("[production] gpu={device_id} done");
+                eprintln!("gpu={device_id} done");
             }
             WorkerMessage::WorkerError { device_id, message } => {
                 completed_workers += 1;
@@ -275,56 +168,81 @@ fn run_production(cli: &Cli, trial_count: usize, include_paths: Vec<String>) -> 
         }
     }
 
-    summary_writer.finish()?;
-
     if !errors.is_empty() {
         return Err(anyhow!(errors.join("; ")));
     }
 
-    eprintln!("[production] wrote {}", summary_path.display());
+    eprintln!(
+        "wrote {} combo result(s) under {}",
+        total_combos,
+        cli.output_dir.display()
+    );
+    Ok(())
+}
+
+/// 1 combo の trial 詳細と summary を、その combo 専用フォルダへ書き出す。
+fn write_combo_output(combo_dirs: &HashMap<u32, PathBuf>, output: &ComboOutput) -> Result<()> {
+    let dir = combo_dirs
+        .get(&output.summary.combo_id)
+        .with_context(|| format!("no output directory for combo {}", output.summary.combo_id))?;
+
+    let mut trial_writer = csv::Writer::from_path(dir.join("trials.csv"))?;
+    for trial in &output.trials {
+        trial_writer.serialize(trial.to_csv_row())?;
+    }
+    trial_writer.flush()?;
+
+    write_json_object(&dir.join("summary.json"), &output.summary)?;
+
+    // x×φ と x×y の2Dヒストグラムを、解析しやすい tidy 形式の CSV で残す。
+    write_histogram_csv(&dir.join("angle_hist.csv"), "phi", &output.hist_phi, HIST_PHI_BINS, |bin| {
+        (bin as f64 + 0.5) * 2.0 * std::f64::consts::PI / HIST_PHI_BINS as f64
+    })?;
+    write_histogram_csv(&dir.join("y_hist.csv"), "y", &output.hist_y, HIST_Y_BINS, |bin| {
+        -HIST_Y_MAX + (bin as f64 + 0.5) * 2.0 * HIST_Y_MAX / HIST_Y_BINS as f64
+    })?;
+    Ok(())
+}
+
+/// x×値 の2Dヒストグラムを `x, <value_label>, count` の tidy 形式 CSV へ書き出す。
+///
+/// `counts` は x を最外として行優先で平坦化されており、`value_center` は2軸目の
+/// bin 番号から bin 中心の値を返す。
+fn write_histogram_csv(
+    path: &Path,
+    value_label: &str,
+    counts: &[u64],
+    value_bins: usize,
+    value_center: impl Fn(usize) -> f64,
+) -> Result<()> {
+    let mut writer = csv::Writer::from_path(path)?;
+    writer.write_record(["x", value_label, "count"])?;
+    for x_bin in 0..HIST_X_BINS {
+        let x_center = (x_bin as f64 + 0.5) / HIST_X_BINS as f64;
+        for value_bin in 0..value_bins {
+            writer.write_record([
+                x_center.to_string(),
+                value_center(value_bin).to_string(),
+                counts[x_bin * value_bins + value_bin].to_string(),
+            ])?;
+        }
+    }
+    writer.flush()?;
     Ok(())
 }
 
 /// CLI設定から GPU worker 用の実行設定を作る。
-fn worker_config(
-    cli: &Cli,
-    device_id: usize,
-    capture_trials: bool,
-    include_paths: Vec<String>,
-    mode: RunMode,
-) -> GpuRunConfig {
+fn worker_config(cli: &Cli, device_id: usize, include_paths: Vec<String>) -> GpuRunConfig {
     GpuRunConfig {
         device_id,
         seed: cli.seed,
         max_steps: cli.max_steps,
         steps_per_launch: cli.steps_per_launch,
+        hist_stride: cli.hist_stride,
         num_streams: cli.streams,
         cuda_include_paths: include_paths,
         cuda_arch: cli.cuda_arch.clone(),
-        capture_trials,
         progress_interval: Duration::from_secs(cli.progress_interval_sec),
-        run_mode_label: run_mode_label(mode).to_string(),
-    }
-}
-
-/// smoke worker の結果を、成功・失敗どちらでも main thread へ返す。
-fn send_worker_result(
-    tx: mpsc::Sender<WorkerMessage>,
-    device_id: usize,
-    result: Result<ComboOutput>,
-) {
-    match result {
-        Ok(output) => {
-            if tx.send(WorkerMessage::ComboFinished(output)).is_ok() {
-                let _ = tx.send(WorkerMessage::WorkerDone { device_id });
-            }
-        }
-        Err(error) => {
-            let _ = tx.send(WorkerMessage::WorkerError {
-                device_id,
-                message: format!("{error:#}"),
-            });
-        }
     }
 }
 
@@ -337,7 +255,6 @@ fn progress_row(
 ) -> ProgressRow {
     ProgressRow {
         timestamp_ms: timestamp_ms(),
-        run_mode: config.run_mode_label.clone(),
         device_id: config.device_id,
         combo_id: progress.combo_id,
         completed_combos,
@@ -350,26 +267,9 @@ fn progress_row(
     }
 }
 
-/// production の共有キューから次の combo を取り出す。
+/// 共有キューから次の combo を取り出す。
 fn next_work(queue: &Arc<Mutex<VecDeque<SimParams>>>) -> Option<SimParams> {
     queue.lock().expect("work queue poisoned").pop_front()
-}
-
-/// smoke run で trial 数をGPU数にできるだけ均等に分割する。
-fn split_trials(total: usize, parts: usize) -> Vec<usize> {
-    let base = total / parts;
-    let remainder = total % parts;
-    (0..parts)
-        .map(|idx| base + usize::from(idx < remainder))
-        .collect()
-}
-
-/// ファイル出力やログに使う実行モード名。
-fn run_mode_label(mode: RunMode) -> &'static str {
-    match mode {
-        RunMode::Smoke => "smoke",
-        RunMode::Production => "production",
-    }
 }
 
 /// 外部依存を増やさず、progress用にUnix epochミリ秒を作る。
@@ -388,56 +288,11 @@ fn write_progress(writer: &mut BufWriter<File>, row: &ProgressRow) -> Result<()>
     Ok(())
 }
 
-fn write_json_object<T: serde::Serialize>(path: &std::path::Path, value: &T) -> Result<()> {
+/// 任意の serializable 値を、整形済み JSON としてファイルへ書き出す。
+fn write_json_object<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     let mut writer = BufWriter::new(File::create(path)?);
     serde_json::to_writer_pretty(&mut writer, value)?;
     writer.write_all(b"\n")?;
     writer.flush()?;
     Ok(())
-}
-
-struct JsonArrayWriter {
-    writer: BufWriter<File>,
-    wrote_any: bool,
-    finished: bool,
-}
-
-impl JsonArrayWriter {
-    fn create(path: &std::path::Path) -> Result<Self> {
-        let mut writer = BufWriter::new(File::create(path)?);
-        writer.write_all(b"[\n")?;
-        writer.flush()?;
-        Ok(Self {
-            writer,
-            wrote_any: false,
-            finished: false,
-        })
-    }
-
-    fn write_element<T: serde::Serialize>(&mut self, value: &T) -> Result<()> {
-        if self.wrote_any {
-            self.writer.write_all(b",\n")?;
-        } else {
-            self.wrote_any = true;
-        }
-
-        self.writer.write_all(b"  ")?;
-        serde_json::to_writer(&mut self.writer, value)?;
-        self.writer.flush()?;
-        Ok(())
-    }
-
-    fn finish(&mut self) -> Result<()> {
-        if self.finished {
-            return Ok(());
-        }
-
-        if self.wrote_any {
-            self.writer.write_all(b"\n")?;
-        }
-        self.writer.write_all(b"]\n")?;
-        self.writer.flush()?;
-        self.finished = true;
-        Ok(())
-    }
 }

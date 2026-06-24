@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 
 // シミュレーション全体で共有する無次元化済みの物理定数。
 pub const L_PERIOD: f64 = 1.0;
@@ -18,70 +18,55 @@ pub const BOUNDARY_REFLECTION_LIMIT: usize = 32;
 pub const CHANNEL_NECK_PHASE: f64 = 0.809_640_837_312_333_2;
 pub const RNG_STATE_BYTES: usize = 256;
 pub const DEFAULT_MAX_STEPS: u64 = 250_000_000; // 2.5 × 10^8
-pub const DEFAULT_PRODUCTION_TRIALS: usize = 1000;
-pub const DEFAULT_SMOKE_TRIALS: usize = 96;
+pub const DEFAULT_TRIALS: usize = 1000;
 
-// rod_simulation.md にある全パラメータ掃引の値。
-pub const M_VALUES: [i32; 5] = [1, 4, 8, 15, 30];
-pub const BETA_QE_VALUES: [f64; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
-pub const DELTA_ALPHA_E_OVER_QL_VALUES: [f64; 6] = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0];
-pub const FORCE_VALUES: [f64; 19] = [
-    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0,
-    90.0, 100.0,
-];
-
-/// 実行モード。smoke は詳細出力付きの小規模確認、production は全体集計用。
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum RunMode {
-    Smoke,
-    Production,
-}
+// 角度・y分布ヒストグラムの解像度と範囲。GPU kernel と CSV 出力で共有する。
+// x は1周期 [0,1) に畳み、φ は [0,2π) に巻き戻し、y は [-Y_MAX, Y_MAX] に収める。
+pub const HIST_X_BINS: usize = 100;
+pub const HIST_PHI_BINS: usize = 36;
+pub const HIST_Y_BINS: usize = 64;
+/// y ヒストグラムの片側範囲。流路半幅 omega(x) の最大値（≈2.18）を覆う値にしておく。
+pub const HIST_Y_MAX: f64 = 2.3;
+/// 何ステップごとにヒストグラムへ加算するかの既定値。
+pub const DEFAULT_HIST_STRIDE: u32 = 100;
 
 /// コマンドライン引数。
 ///
-/// デフォルトでは GPU 1,2,3 を使う smoke run にしておき、本番実行は明示的な
-/// `--mode production` が必要になるようにしている。
+/// 掃引するパラメータ（m, f, βqE, ΔαE/(qL)）はリストで与え、それらの直積を
+/// combo として実行する。各 combo の結果は `output_dir` の下の専用フォルダへ保存する。
 #[derive(Debug, Parser)]
 #[command(
     version,
     about = "GPU simulation for Brownian motion of rod-like particles"
 )]
 pub struct Cli {
-    #[arg(long, value_enum, default_value_t = RunMode::Smoke)]
-    pub mode: RunMode,
-
+    /// 結果を書き出すルートディレクトリ。combo ごとにこの下へサブフォルダを作る。
     #[arg(long, default_value = "output")]
     pub output_dir: PathBuf,
 
-    #[arg(long, value_delimiter = ',', default_value = "1,2,3")]
+    /// 使用する GPU デバイス番号（カンマ区切り）。
+    #[arg(long, value_delimiter = ',', default_value = "0,1,2")]
     pub devices: Vec<usize>,
 
-    #[arg(long)]
-    pub allow_device_zero: bool,
+    /// 1 combo あたりの試行回数。
+    #[arg(long, default_value_t = DEFAULT_TRIALS)]
+    pub trials: usize,
 
-    #[arg(long)]
-    pub trials: Option<usize>,
+    /// 棒の片側代表点数 m のリスト（カンマ区切り）。
+    #[arg(long, value_delimiter = ',', required = true)]
+    pub m: Vec<i32>,
 
-    #[arg(long, default_value_t = 0)]
-    pub smoke_combo_id: usize,
+    /// 駆動力 f のリスト。`1/3` のような分数も受け付ける。
+    #[arg(long = "f", value_delimiter = ',', value_parser = parse_ratio, required = true)]
+    pub f: Vec<f64>,
 
-    #[arg(long)]
-    pub smoke_m: Option<i32>,
+    /// βqE のリスト。`1/3` のような分数も受け付ける。
+    #[arg(long = "beta-qe", value_delimiter = ',', value_parser = parse_ratio, required = true)]
+    pub beta_qe: Vec<f64>,
 
-    #[arg(long)]
-    pub smoke_beta_qe: Option<f64>,
-
-    #[arg(long)]
-    pub smoke_delta_alpha_e_over_ql: Option<f64>,
-
-    #[arg(long = "smoke-f", alias = "smoke-force")]
-    pub smoke_f: Option<f64>,
-
-    #[arg(long)]
-    pub combo_limit: Option<usize>,
-
-    #[arg(long, default_value_t = 0)]
-    pub combo_start: usize,
+    /// ΔαE/(qL) のリスト。`1/3` のような分数も受け付ける。
+    #[arg(long = "delta-alpha-e-over-ql", value_delimiter = ',', value_parser = parse_ratio, required = true)]
+    pub delta_alpha_e_over_ql: Vec<f64>,
 
     #[arg(long, default_value_t = DEFAULT_MAX_STEPS)]
     pub max_steps: u64,
@@ -89,7 +74,11 @@ pub struct Cli {
     #[arg(long, default_value_t = 10_000)]
     pub steps_per_launch: u32,
 
-    /// production で各 GPU が同時並行に処理する combo 数（=CUDA stream 数）。
+    /// 角度・y分布ヒストグラムへ加算するステップ間隔。0 で記録を無効にする。
+    #[arg(long, default_value_t = DEFAULT_HIST_STRIDE)]
+    pub hist_stride: u32,
+
+    /// 各 GPU が同時並行に処理する combo 数（=CUDA stream 数）。
     ///
     /// N=1000 では1 combo が A100 の数 SM しか使わないため、複数 combo を
     /// 並行させて占有率を上げる。約16でA100が飽和する（measured knee）。
@@ -107,6 +96,36 @@ pub struct Cli {
 
     #[arg(long, default_value = "compute_80")]
     pub cuda_arch: String,
+}
+
+/// `a/b` の分数表記と通常の小数表記の両方を f64 として解釈する。
+///
+/// `1/3` のように割り切れない値もコマンドラインから直接与えられるようにする。
+fn parse_ratio(text: &str) -> Result<f64, String> {
+    let text = text.trim();
+
+    let value = if let Some((numerator, denominator)) = text.split_once('/') {
+        let numerator: f64 = numerator
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid numerator in `{text}`"))?;
+        let denominator: f64 = denominator
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid denominator in `{text}`"))?;
+        if denominator == 0.0 {
+            return Err(format!("division by zero in `{text}`"));
+        }
+        numerator / denominator
+    } else {
+        text.parse()
+            .map_err(|_| format!("`{text}` is not a number"))?
+    };
+
+    if !value.is_finite() {
+        return Err(format!("`{text}` is not a finite number"));
+    }
+    Ok(value)
 }
 
 /// 1つのパラメータ組み合わせ。
@@ -127,19 +146,33 @@ pub fn particle_length(m: i32) -> f64 {
     2.0 * f64::from(m) * PARTICLE_DX
 }
 
-/// 仕様書の全パラメータ組み合わせを決定的な順序で列挙する。
-pub fn all_parameter_combinations() -> Vec<SimParams> {
+/// CLI で与えられた各パラメータのリストから、その直積を combo として列挙する。
+///
+/// 列挙順は m → βqE → ΔαE/(qL) → f の入れ子で、`combo_id` を 0 から振り直す。
+/// 同じ値が重複して与えられても、combo が二重にならないよう各リストを重複排除する。
+pub fn parameter_combinations(
+    m_values: &[i32],
+    beta_qe_values: &[f64],
+    delta_alpha_e_over_ql_values: &[f64],
+    force_values: &[f64],
+) -> anyhow::Result<Vec<SimParams>> {
+    for &m in m_values {
+        anyhow::ensure!(m >= 1, "m must be at least 1, got {m}");
+    }
+
+    let m_values = dedup_in_order_i32(m_values);
+    let beta_qe_values = dedup_in_order_f64(beta_qe_values);
+    let delta_values = dedup_in_order_f64(delta_alpha_e_over_ql_values);
+    let force_values = dedup_in_order_f64(force_values);
+
     let mut combos = Vec::with_capacity(
-        M_VALUES.len()
-            * BETA_QE_VALUES.len()
-            * DELTA_ALPHA_E_OVER_QL_VALUES.len()
-            * FORCE_VALUES.len(),
+        m_values.len() * beta_qe_values.len() * delta_values.len() * force_values.len(),
     );
 
-    for &m in &M_VALUES {
-        for &beta_qe in &BETA_QE_VALUES {
-            for &delta_alpha_e_over_ql in &DELTA_ALPHA_E_OVER_QL_VALUES {
-                for &force in &FORCE_VALUES {
+    for &m in &m_values {
+        for &beta_qe in &beta_qe_values {
+            for &delta_alpha_e_over_ql in &delta_values {
+                for &force in &force_values {
                     combos.push(SimParams {
                         combo_id: combos.len() as u32,
                         m,
@@ -153,99 +186,57 @@ pub fn all_parameter_combinations() -> Vec<SimParams> {
         }
     }
 
-    combos
-}
-
-/// production run で処理するパラメータ組み合わせだけを取り出す。
-pub fn production_parameter_combinations(
-    combo_start: usize,
-    combo_limit: Option<usize>,
-) -> anyhow::Result<Vec<SimParams>> {
-    let mut combos = all_parameter_combinations();
-    if let Some(limit) = combo_limit {
-        combos.truncate(limit);
-    }
-
-    anyhow::ensure!(
-        combo_start < combos.len(),
-        "--combo-start {} leaves no parameter combinations to run after applying --combo-limit ({} combo(s) selected)",
-        combo_start,
-        combos.len()
-    );
-
-    if combo_start > 0 {
-        combos.drain(..combo_start);
-    }
-
+    anyhow::ensure!(!combos.is_empty(), "no parameter combinations to run");
     Ok(combos)
 }
 
-/// smoke run で使う1つのパラメータ組み合わせを選び、必要なら物理量を差し替える。
-pub fn smoke_parameter_combination(
-    smoke_combo_id: usize,
-    smoke_m: Option<i32>,
-    smoke_beta_qe: Option<f64>,
-    smoke_delta_alpha_e_over_ql: Option<f64>,
-    smoke_f: Option<f64>,
-) -> anyhow::Result<SimParams> {
-    let combos = all_parameter_combinations();
-    let Some(mut params) = combos.get(smoke_combo_id).copied() else {
-        anyhow::bail!("smoke combo id {smoke_combo_id} is out of range");
-    };
-
-    if let Some(m) = smoke_m {
-        anyhow::ensure!((1..=30).contains(&m), "--smoke-m must be between 1 and 30");
-        params.m = m;
-        params.l = particle_length(m);
-    }
-
-    if let Some(beta_qe) = smoke_beta_qe {
-        ensure_finite_smoke_override("smoke-beta-qe", beta_qe)?;
-        params.beta_qe = beta_qe;
-    }
-
-    if let Some(delta_alpha_e_over_ql) = smoke_delta_alpha_e_over_ql {
-        ensure_finite_smoke_override("smoke-delta-alpha-e-over-ql", delta_alpha_e_over_ql)?;
-        params.delta_alpha_e_over_ql = delta_alpha_e_over_ql;
-    }
-
-    if let Some(force) = smoke_f {
-        ensure_finite_smoke_override("smoke-f", force)?;
-        params.force = force;
-    }
-
-    Ok(params)
+/// combo の物理パラメータから、結果を保存するサブフォルダ名を作る。
+pub fn combo_dir_name(params: &SimParams) -> String {
+    format!(
+        "m{}_f{}_beta{}_delta{}",
+        params.m,
+        format_param(params.force),
+        format_param(params.beta_qe),
+        format_param(params.delta_alpha_e_over_ql),
+    )
 }
 
-/// smoke 専用上書き値に NaN や無限大が混ざらないことを確認する。
-fn ensure_finite_smoke_override(name: &str, value: f64) -> anyhow::Result<()> {
-    anyhow::ensure!(value.is_finite(), "--{} must be finite", name);
-    Ok(())
+/// フォルダ名用に f64 を、末尾の余分なゼロを落とした短い文字列へ整形する。
+fn format_param(value: f64) -> String {
+    let text = format!("{value:.6}");
+    let trimmed = text.trim_end_matches('0').trim_end_matches('.');
+    trimmed.to_string()
 }
 
-/// architecture.md の制約に従い、GPU 0 を誤って使わないように検証する。
-pub fn validate_devices(devices: &[usize], allow_device_zero: bool) -> anyhow::Result<()> {
+/// i32 のリストを、出現順を保ったまま重複排除する。
+fn dedup_in_order_i32(values: &[i32]) -> Vec<i32> {
+    let mut unique = Vec::with_capacity(values.len());
+    for &value in values {
+        if !unique.contains(&value) {
+            unique.push(value);
+        }
+    }
+    unique
+}
+
+/// f64 のリストを、ビット表現で同一視して出現順を保ったまま重複排除する。
+fn dedup_in_order_f64(values: &[f64]) -> Vec<f64> {
+    let mut unique: Vec<f64> = Vec::with_capacity(values.len());
+    for &value in values {
+        if !unique.iter().any(|&kept| kept.to_bits() == value.to_bits()) {
+            unique.push(value);
+        }
+    }
+    unique
+}
+
+/// 少なくとも1つの GPU デバイスが指定されていることを確認する。
+pub fn validate_devices(devices: &[usize]) -> anyhow::Result<()> {
     anyhow::ensure!(
         !devices.is_empty(),
         "at least one GPU device must be specified"
     );
-
-    if !allow_device_zero {
-        anyhow::ensure!(
-            !devices.contains(&0),
-            "GPU device 0 is disabled by architecture.md; pass --allow-device-zero only if you really intend to use it"
-        );
-    }
-
     Ok(())
-}
-
-/// 実行モードごとの既定 trial 数。
-pub fn default_trial_count(mode: RunMode) -> usize {
-    match mode {
-        RunMode::Smoke => DEFAULT_SMOKE_TRIALS,
-        RunMode::Production => DEFAULT_PRODUCTION_TRIALS,
-    }
 }
 
 #[cfg(test)]
@@ -253,14 +244,61 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parameter_count_matches_spec() {
-        assert_eq!(all_parameter_combinations().len(), 3420);
+    fn parameter_combinations_form_cartesian_product() {
+        let combos =
+            parameter_combinations(&[1, 4], &[0.25, 0.5], &[1.0], &[1.0, 2.0, 3.0]).unwrap();
+
+        #[allow(clippy::identity_op)]
+        {
+            assert_eq!(combos.len(), 2 * 2 * 1 * 3);
+        }
+        // combo_id は 0 から連番で振られる。
+        assert_eq!(combos.first().unwrap().combo_id, 0);
+        assert_eq!(combos.last().unwrap().combo_id, 11);
+        // 入れ子の最内は f なので、先頭2要素は f だけが変わる。
+        assert_eq!(combos[0].m, 1);
+        assert_eq!(combos[0].force, 1.0);
+        assert_eq!(combos[1].force, 2.0);
+    }
+
+    #[test]
+    fn parameter_combinations_dedup_repeated_values() {
+        let combos = parameter_combinations(&[1, 1, 4], &[0.5, 0.5], &[1.0], &[2.0]).unwrap();
+        assert_eq!(combos.len(), 2);
+    }
+
+    #[test]
+    fn parameter_combinations_reject_non_positive_m() {
+        let error = parameter_combinations(&[0], &[0.5], &[1.0], &[2.0]).unwrap_err();
+        assert!(error.to_string().contains("m must be at least 1"));
+    }
+
+    #[test]
+    fn parse_ratio_accepts_fractions_and_decimals() {
+        assert!((parse_ratio("1/3").unwrap() - 1.0 / 3.0).abs() < 1.0e-15);
+        assert_eq!(parse_ratio("0.5").unwrap(), 0.5);
+        assert_eq!(parse_ratio(" 3 / 4 ").unwrap(), 0.75);
+        assert!(parse_ratio("1/0").is_err());
+        assert!(parse_ratio("abc").is_err());
+    }
+
+    #[test]
+    fn combo_dir_name_trims_trailing_zeros() {
+        let params = SimParams {
+            combo_id: 0,
+            m: 3,
+            l: particle_length(3),
+            beta_qe: 1.0,
+            delta_alpha_e_over_ql: 0.5,
+            force: 0.0,
+        };
+        assert_eq!(combo_dir_name(&params), "m3_f0_beta1_delta0.5");
     }
 
     #[test]
     fn m_values_map_to_expected_point_counts_and_lengths() {
-        let expected_points = [3, 9, 17, 31, 61];
-        for (&m, &points) in M_VALUES.iter().zip(&expected_points) {
+        let expected_points = [(1, 3), (4, 9), (8, 17), (15, 31), (30, 61)];
+        for (m, points) in expected_points {
             assert_eq!(2 * m + 1, points);
             assert_eq!(particle_length(m), 2.0 * f64::from(m) * 0.8 * SIGMA);
         }
@@ -279,58 +317,5 @@ mod tests {
         assert_eq!(MAX_WALL_REPULSION_FORCE, 2.5e4);
         assert_eq!(BOUNDARY_REFLECTION_LIMIT, 32);
         assert!((CHANNEL_NECK_PHASE - 0.809_640_837_312_333_2).abs() < 1.0e-15);
-    }
-
-    #[test]
-    fn production_range_keeps_original_combo_ids() {
-        let combos = production_parameter_combinations(495, Some(684)).unwrap();
-        assert_eq!(combos.first().unwrap().combo_id, 495);
-        assert_eq!(combos.last().unwrap().combo_id, 683);
-        assert!(combos.iter().all(|params| params.m == 1));
-        assert_eq!(combos.len(), 189);
-    }
-
-    #[test]
-    fn production_range_rejects_empty_selection() {
-        let error = production_parameter_combinations(684, Some(684)).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("leaves no parameter combinations")
-        );
-    }
-
-    /// smoke 専用の `m` 上書きが、本番掃引の組み合わせを増やさず棒長だけ変えることを確認する。
-    #[test]
-    fn smoke_parameters_can_override_m_without_changing_sweep() {
-        let params = smoke_parameter_combination(0, Some(3), None, None, None).unwrap();
-
-        assert_eq!(params.combo_id, 0);
-        assert_eq!(params.m, 3);
-        assert_eq!(params.l, particle_length(3));
-        assert_eq!(all_parameter_combinations().len(), 3420);
-    }
-
-    /// smoke 専用の物理量上書きが、0を含む任意の有限値を受け付けることを確認する。
-    #[test]
-    fn smoke_parameters_can_override_physical_values() {
-        let params =
-            smoke_parameter_combination(0, Some(3), Some(1.0), Some(0.0), Some(0.0)).unwrap();
-
-        assert_eq!(params.combo_id, 0);
-        assert_eq!(params.m, 3);
-        assert_eq!(params.l, particle_length(3));
-        assert_eq!(params.beta_qe, 1.0);
-        assert_eq!(params.delta_alpha_e_over_ql, 0.0);
-        assert_eq!(params.force, 0.0);
-        assert_eq!(all_parameter_combinations().len(), 3420);
-    }
-
-    /// smoke 専用の物理量上書きで非有限値を弾けることを確認する。
-    #[test]
-    fn smoke_parameters_reject_non_finite_overrides() {
-        let error = smoke_parameter_combination(0, None, Some(f64::NAN), None, None).unwrap_err();
-
-        assert!(error.to_string().contains("--smoke-beta-qe must be finite"));
     }
 }

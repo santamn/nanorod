@@ -29,6 +29,10 @@ struct KernelParams
   double rc2;
   double max_wall_repulsion_force;
   double channel_neck_phase;
+  int hist_x_bins;
+  int hist_phi_bins;
+  int hist_y_bins;
+  double hist_y_max;
 };
 
 // 並進力と角度方向トルクをまとめ、予測点と修正点で同じ力計算を使い回す。
@@ -426,6 +430,47 @@ extern "C" __global__ void init_trials_kernel(
   pass_directions[i] = 0;
 }
 
+// 通過途中の棒の (x, φ) と (x, y) を2つの2Dヒストグラムへ1票ずつ加算する。
+//
+// x は1周期 [0,1) に畳み、φ は [0,2π) に巻き戻し、y は [-y_max, y_max] に収める。
+// 全trial・全ステップにわたって占有時間で重み付けされた分布が得られる。
+__device__ void accumulate_histograms(
+    double xi,
+    double yi,
+    double phii,
+    const KernelParams params,
+    unsigned long long *hist_phi,
+    unsigned long long *hist_y)
+{
+  // x を1周期に畳んでから x-bin を決める。負の x も正しく [0,1) に入る。
+  double xf = xi - floor(xi);
+  int xb = static_cast<int>(xf * params.hist_x_bins);
+  if (xb >= params.hist_x_bins)
+  {
+    xb = params.hist_x_bins - 1;
+  }
+
+  // φ を [0,2π) に巻き戻して φ-bin を決める。
+  double two_pi = 2.0 * CUDART_PI;
+  double pf = phii - two_pi * floor(phii / two_pi);
+  int pb = static_cast<int>(pf / two_pi * params.hist_phi_bins);
+  if (pb >= params.hist_phi_bins)
+  {
+    pb = params.hist_phi_bins - 1;
+  }
+  atomicAdd(&hist_phi[xb * params.hist_phi_bins + pb], 1ULL);
+
+  // y を [-y_max, y_max] に収めて y-bin を決める。
+  double yc = clamp_double(yi, -params.hist_y_max, params.hist_y_max);
+  double yf = (yc + params.hist_y_max) / (2.0 * params.hist_y_max);
+  int yb = static_cast<int>(yf * params.hist_y_bins);
+  if (yb >= params.hist_y_bins)
+  {
+    yb = params.hist_y_bins - 1;
+  }
+  atomicAdd(&hist_y[xb * params.hist_y_bins + yb], 1ULL);
+}
+
 // 未完了trialを固定ステップ数だけ進め、初通過またはmax_steps到達を記録する。
 extern "C" __global__ void simulate_kernel(
     KernelParams params,
@@ -442,8 +487,11 @@ extern "C" __global__ void simulate_kernel(
     int *statuses,
     int *pass_directions,
     unsigned long long *counters,
+    unsigned long long *hist_phi,
+    unsigned long long *hist_y,
     int n_trials,
     unsigned int steps_per_launch,
+    unsigned int hist_stride,
     unsigned long long max_steps)
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -525,6 +573,12 @@ extern "C" __global__ void simulate_kernel(
     phii = corrected.phi;
     step_count += 1ULL;
     double ti = static_cast<double>(step_count) * params.dt;
+
+    // 通過途中の状態を一定間隔でヒストグラムへ記録する。
+    if (hist_stride > 0 && (step_count % hist_stride) == 0ULL)
+    {
+      accumulate_histograms(xi, yi, phii, params, hist_phi, hist_y);
+    }
 
     // 補間はせず、初めて x0 ± 1 のどちらかへ到達したステップ末の状態を記録する。
     if (xi > target_right_x[i])

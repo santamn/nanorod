@@ -85,7 +85,7 @@ pub struct TrialCsvRow {
 #[derive(Clone, Debug, Serialize)]
 pub struct SummaryRow {
     pub combo_id: u32,
-    pub device_id: i64,
+    pub device_id: usize,
     pub m: i32,
     pub l: f64,
     pub beta_qe: f64,
@@ -101,7 +101,8 @@ pub struct SummaryRow {
     pub t1: f64,
     #[serde(rename = "T2")]
     pub t2: f64,
-    pub v: f64,
+    /// 移動度 μ = v/f（v = L/T1 は1周期あたりの平均速度）。f=0 では定義できず NaN。
+    pub mu: f64,
     #[serde(rename = "D_eff")]
     pub d_eff: f64,
     pub dt: f64,
@@ -114,7 +115,6 @@ pub struct SummaryRow {
 #[derive(Debug, Serialize)]
 pub struct ProgressRow {
     pub timestamp_ms: u128,
-    pub run_mode: String,
     pub device_id: usize,
     pub combo_id: u32,
     pub completed_combos: usize,
@@ -379,73 +379,20 @@ pub fn summarize_trials(
         }
     }
 
-    // 初通過した trial だけで平均初通過時間と有効拡散係数を計算する。
-    let (t1, t2, v, d_eff) = if n_ok > 0 {
+    // 初通過した trial だけで平均初通過時間・移動度・有効拡散係数を計算する。
+    let (t1, t2, mu, d_eff) = if n_ok > 0 {
         let n_ok_f = n_ok as f64;
         let t1 = sum_t / n_ok_f;
         let t2 = sum_t2 / n_ok_f;
+        // μ = v/f（v = L/T1）。f=0 では移動度が定義できないので NaN を返す。
         let v = L_PERIOD / t1;
+        let mu = if params.force != 0.0 {
+            v / params.force
+        } else {
+            f64::NAN
+        };
         let d_eff = 0.5 * L_PERIOD * L_PERIOD * (t2 - t1 * t1) / (t1 * t1 * t1);
-        (t1, t2, v, d_eff)
-    } else {
-        (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
-    };
-
-    SummaryRow {
-        combo_id: params.combo_id,
-        device_id: device_id as i64,
-        m: params.m,
-        l: params.l,
-        beta_qe: params.beta_qe,
-        delta_alpha_e_over_ql: params.delta_alpha_e_over_ql,
-        f: params.force,
-        n_total,
-        n_ok,
-        n_right_passes,
-        n_left_passes,
-        n_max_steps,
-        passage_fraction: n_ok as f64 / n_total as f64,
-        t1,
-        t2,
-        v,
-        d_eff,
-        dt: crate::config::DT,
-        sigma: SIGMA,
-        epsilon: EPSILON,
-        seed,
-    }
-}
-
-/// smoke run で複数 GPU に分けた同一 combo の部分 summary をまとめる。
-pub fn aggregate_summaries(
-    device_id: i64,
-    params: SimParams,
-    seed: u64,
-    partials: &[SummaryRow],
-) -> SummaryRow {
-    let n_total = partials.iter().map(|row| row.n_total).sum();
-    let n_ok: usize = partials.iter().map(|row| row.n_ok).sum();
-    let n_right_passes = partials.iter().map(|row| row.n_right_passes).sum();
-    let n_left_passes = partials.iter().map(|row| row.n_left_passes).sum();
-    let n_max_steps = partials.iter().map(|row| row.n_max_steps).sum();
-
-    let mut sum_t = 0.0;
-    let mut sum_t2 = 0.0;
-    for row in partials {
-        if row.n_ok > 0 {
-            sum_t += row.t1 * row.n_ok as f64;
-            sum_t2 += row.t2 * row.n_ok as f64;
-        }
-    }
-
-    // 部分 summary は `T1`, `T2` だけを持つので、n_ok で重み付けして復元する。
-    let (t1, t2, v, d_eff) = if n_ok > 0 {
-        let n_ok_f = n_ok as f64;
-        let t1 = sum_t / n_ok_f;
-        let t2 = sum_t2 / n_ok_f;
-        let v = L_PERIOD / t1;
-        let d_eff = 0.5 * L_PERIOD * L_PERIOD * (t2 - t1 * t1) / (t1 * t1 * t1);
-        (t1, t2, v, d_eff)
+        (t1, t2, mu, d_eff)
     } else {
         (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
     };
@@ -466,7 +413,7 @@ pub fn aggregate_summaries(
         passage_fraction: n_ok as f64 / n_total as f64,
         t1,
         t2,
-        v,
+        mu,
         d_eff,
         dt: crate::config::DT,
         sigma: SIGMA,
@@ -486,7 +433,6 @@ pub fn validate_static_geometry() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::M_VALUES;
 
     #[test]
     fn omega_is_periodic() {
@@ -570,7 +516,7 @@ mod tests {
 
     #[test]
     fn diffusion_is_positive_and_finite_for_all_lengths() {
-        for &m in &M_VALUES {
+        for m in [1, 4, 8, 15, 30] {
             let diffusion = diffusion_for_length(particle_length(m));
             assert!(diffusion.d_parallel.is_finite() && diffusion.d_parallel > 0.0);
             assert!(diffusion.d_perp.is_finite() && diffusion.d_perp > 0.0);

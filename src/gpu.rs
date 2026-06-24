@@ -8,8 +8,9 @@ use cudarc::driver::{
 use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 
 use crate::config::{
-    BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, DT, EPSILON, MAX_WALL_REPULSION_FORCE,
-    RNG_STATE_BYTES, SIGMA, SimParams, WALL_DX, WALL_K, default_trial_count,
+    BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, DT, EPSILON, HIST_PHI_BINS, HIST_X_BINS,
+    HIST_Y_BINS, HIST_Y_MAX, MAX_WALL_REPULSION_FORCE, RNG_STATE_BYTES, SIGMA, SimParams, WALL_DX,
+    WALL_K,
 };
 use crate::model::{
     SummaryRow, TrialResult, diffusion_for_length, summarize_trials, wall_y_samples,
@@ -44,6 +45,10 @@ struct KernelParams {
     rc2: f64,
     max_wall_repulsion_force: f64,
     channel_neck_phase: f64,
+    hist_x_bins: i32,
+    hist_phi_bins: i32,
+    hist_y_bins: i32,
+    hist_y_max: f64,
 }
 
 unsafe impl DeviceRepr for KernelParams {}
@@ -75,6 +80,10 @@ impl KernelParams {
             rc2: rc * rc,
             max_wall_repulsion_force: MAX_WALL_REPULSION_FORCE,
             channel_neck_phase: CHANNEL_NECK_PHASE,
+            hist_x_bins: HIST_X_BINS as i32,
+            hist_phi_bins: HIST_PHI_BINS as i32,
+            hist_y_bins: HIST_Y_BINS as i32,
+            hist_y_max: HIST_Y_MAX,
         }
     }
 }
@@ -86,30 +95,25 @@ pub struct GpuRunConfig {
     pub seed: u64,
     pub max_steps: u64,
     pub steps_per_launch: u32,
+    /// 何ステップごとに角度・y分布ヒストグラムへ加算するか。0 で記録を無効にする。
+    pub hist_stride: u32,
     /// production で1 GPU が同時並行に走らせる combo 数（CUDA stream 数）。
     pub num_streams: usize,
     pub cuda_include_paths: Vec<String>,
     pub cuda_arch: String,
-    pub capture_trials: bool,
     pub progress_interval: Duration,
-    pub run_mode_label: String,
-}
-
-/// GPU worker が処理する1バッチ分の仕事。
-///
-/// production では1 combo 全 trial、smoke では1 combo の一部 trial を表す。
-#[derive(Clone, Copy, Debug)]
-pub struct ComboWork {
-    pub params: SimParams,
-    pub trial_count: usize,
-    pub trial_offset: u64,
 }
 
 /// 1 combo の GPU 実行結果。
+///
+/// `hist_phi` は (x × φ)、`hist_y` は (x × y) の2Dヒストグラムを、x を最外として
+/// 行優先で平坦化したもの。
 #[derive(Debug)]
 pub struct ComboOutput {
     pub summary: SummaryRow,
     pub trials: Vec<TrialResult>,
+    pub hist_phi: Vec<u64>,
+    pub hist_y: Vec<u64>,
 }
 
 /// kernel chunk ごとに host 側へ返す進捗。
@@ -143,198 +147,9 @@ pub fn cuda_include_paths(user_paths: &[String]) -> Vec<String> {
     paths
 }
 
-/// 1つの combo を GPU 上で初期化から初通過判定まで実行する。
-///
-/// `capture_trials` が true の smoke run では初期状態・終了状態も host へ戻す。
-pub fn run_combo<F>(
-    config: &GpuRunConfig,
-    work: ComboWork,
-    mut on_progress: F,
-) -> Result<ComboOutput>
-where
-    F: FnMut(GpuProgress),
-{
-    anyhow::ensure!(
-        work.trial_count > 0,
-        "trial_count must be positive for combo {}",
-        work.params.combo_id
-    );
-
-    let ptx = compile_kernel(config).context("failed to compile CUDA kernel with NVRTC")?;
-    let ctx = CudaContext::new(config.device_id).with_context(|| {
-        format!(
-            "failed to create CUDA context for device {}",
-            config.device_id
-        )
-    })?;
-    let stream = ctx.default_stream();
-    let module = ctx.load_module(ptx).context("failed to load CUDA module")?;
-
-    let setup_rng = module.load_function("setup_rng_kernel")?;
-    let init_trials = module.load_function("init_trials_kernel")?;
-    let simulate = module.load_function("simulate_kernel")?;
-
-    let params = KernelParams::from_params(work.params);
-    let n_trials_i32 = i32::try_from(work.trial_count).context("too many trials for i32")?;
-    let rng_stride = i32::try_from(RNG_STATE_BYTES).expect("RNG_STATE_BYTES fits in i32");
-    let sequence_offset = u64::from(work.params.combo_id) * 1_000_000_000 + work.trial_offset;
-
-    let mut rng_states = stream.alloc_zeros::<u8>(work.trial_count * RNG_STATE_BYTES)?;
-    let wall_y = wall_y_samples();
-    let wall_y_dev = stream.clone_htod(&wall_y)?;
-
-    let mut x0 = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut y0 = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut phi0 = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut x = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut y = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut phi = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut target_right_x = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut target_left_x = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut times = stream.alloc_zeros::<f64>(work.trial_count)?;
-    let mut steps = stream.alloc_zeros::<u64>(work.trial_count)?;
-    let mut statuses = stream.alloc_zeros::<i32>(work.trial_count)?;
-    let mut pass_directions = stream.alloc_zeros::<i32>(work.trial_count)?;
-    let mut counters = stream.alloc_zeros::<u64>(2)?;
-
-    let cfg = launch_config_for_trials(work.trial_count);
-
-    // trial ごとに独立した cuRAND state を作る。chunk をまたいでも state は保持する。
-    let mut setup = stream.launch_builder(&setup_rng);
-    setup.arg(&mut rng_states);
-    setup.arg(&rng_stride);
-    setup.arg(&config.seed);
-    setup.arg(&sequence_offset);
-    setup.arg(&n_trials_i32);
-    unsafe { setup.launch(cfg) }?;
-
-    // 初期位置・初期角度を GPU 上で生成し、状態配列を初期化する。
-    let mut init = stream.launch_builder(&init_trials);
-    init.arg(&params);
-    init.arg(&mut rng_states);
-    init.arg(&rng_stride);
-    init.arg(&mut x0);
-    init.arg(&mut y0);
-    init.arg(&mut phi0);
-    init.arg(&mut x);
-    init.arg(&mut y);
-    init.arg(&mut phi);
-    init.arg(&mut target_right_x);
-    init.arg(&mut target_left_x);
-    init.arg(&mut times);
-    init.arg(&mut steps);
-    init.arg(&mut statuses);
-    init.arg(&mut pass_directions);
-    init.arg(&n_trials_i32);
-    unsafe { init.launch(cfg) }?;
-
-    let mut launched_steps = 0_u64;
-    let mut last_progress = Instant::now();
-    loop {
-        // 長時間 kernel になり過ぎないよう、固定ステップ数ごとに host へ戻る。
-        let mut step_kernel = stream.launch_builder(&simulate);
-        step_kernel.arg(&params);
-        step_kernel.arg(&mut rng_states);
-        step_kernel.arg(&rng_stride);
-        step_kernel.arg(&wall_y_dev);
-        step_kernel.arg(&mut x);
-        step_kernel.arg(&mut y);
-        step_kernel.arg(&mut phi);
-        step_kernel.arg(&target_right_x);
-        step_kernel.arg(&target_left_x);
-        step_kernel.arg(&mut times);
-        step_kernel.arg(&mut steps);
-        step_kernel.arg(&mut statuses);
-        step_kernel.arg(&mut pass_directions);
-        step_kernel.arg(&mut counters);
-        step_kernel.arg(&n_trials_i32);
-        step_kernel.arg(&config.steps_per_launch);
-        step_kernel.arg(&config.max_steps);
-        unsafe { step_kernel.launch(cfg) }?;
-
-        launched_steps = launched_steps.saturating_add(u64::from(config.steps_per_launch));
-        stream.synchronize()?;
-
-        let host_counters = stream.clone_dtoh(&counters)?;
-        let completed_trials = (host_counters[0] + host_counters[1]) as usize;
-        let should_report = last_progress.elapsed() >= config.progress_interval
-            || completed_trials == work.trial_count
-            || launched_steps >= config.max_steps;
-
-        if should_report {
-            // 結果CSVとは別に、実行途中でも進捗を見られるようにする。
-            on_progress(GpuProgress {
-                combo_id: work.params.combo_id,
-                completed_trials,
-                total_trials: work.trial_count,
-                current_steps: launched_steps.min(config.max_steps),
-                status: if completed_trials == work.trial_count {
-                    "completed".to_string()
-                } else {
-                    "running".to_string()
-                },
-            });
-            last_progress = Instant::now();
-        }
-
-        if completed_trials == work.trial_count || launched_steps >= config.max_steps {
-            break;
-        }
-    }
-
-    stream.synchronize()?;
-    let host_times = stream.clone_dtoh(&times)?;
-    let host_statuses = stream.clone_dtoh(&statuses)?;
-    let host_pass_directions = stream.clone_dtoh(&pass_directions)?;
-    // production では summary に必要な T・status・通過方向だけを戻す。
-    let summary = summarize_trials(
-        config.device_id,
-        work.params,
-        work.trial_count,
-        config.seed,
-        &host_times,
-        &host_statuses,
-        &host_pass_directions,
-    );
-
-    let trials = if config.capture_trials {
-        // smoke run だけ、初期状態と終了状態を含む詳細を出力する。
-        let host_x0 = stream.clone_dtoh(&x0)?;
-        let host_y0 = stream.clone_dtoh(&y0)?;
-        let host_phi0 = stream.clone_dtoh(&phi0)?;
-        let host_x = stream.clone_dtoh(&x)?;
-        let host_y = stream.clone_dtoh(&y)?;
-        let host_phi = stream.clone_dtoh(&phi)?;
-        let host_steps = stream.clone_dtoh(&steps)?;
-
-        (0..work.trial_count)
-            .map(|idx| TrialResult {
-                combo_id: work.params.combo_id,
-                trial_id: work.trial_offset + idx as u64,
-                device_id: config.device_id,
-                params: work.params,
-                x0: host_x0[idx],
-                y0: host_y0[idx],
-                phi0: host_phi0[idx],
-                x_end: host_x[idx],
-                y_end: host_y[idx],
-                phi_end: host_phi[idx],
-                t: host_times[idx],
-                steps: host_steps[idx],
-                status: host_statuses[idx],
-                pass_direction: host_pass_directions[idx],
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
-
-    Ok(ComboOutput { summary, trials })
-}
-
 /// 1つの CUDA stream が処理中の combo の進行状況。
 struct SlotJob {
-    work: ComboWork,
+    params: SimParams,
     kparams: KernelParams,
     launched_steps: u64,
     last_progress: Instant,
@@ -360,6 +175,8 @@ struct StreamSlot {
     statuses: CudaSlice<i32>,
     pass_directions: CudaSlice<i32>,
     counters: CudaSlice<u64>,
+    hist_phi: CudaSlice<u64>,
+    hist_y: CudaSlice<u64>,
     job: Option<SlotJob>,
 }
 
@@ -381,6 +198,9 @@ impl StreamSlot {
         let statuses = stream.alloc_zeros::<i32>(trial_count)?;
         let pass_directions = stream.alloc_zeros::<i32>(trial_count)?;
         let counters = stream.alloc_zeros::<u64>(2)?;
+        // combo 全体（全trial・全ステップ）で共有して票を貯める2Dヒストグラム。
+        let hist_phi = stream.alloc_zeros::<u64>(HIST_X_BINS * HIST_PHI_BINS)?;
+        let hist_y = stream.alloc_zeros::<u64>(HIST_X_BINS * HIST_Y_BINS)?;
         Ok(Self {
             stream,
             rng_states,
@@ -397,17 +217,19 @@ impl StreamSlot {
             statuses,
             pass_directions,
             counters,
+            hist_phi,
+            hist_y,
             job: None,
         })
     }
 
     /// この slot へ新しい combo を割り当て、cuRAND state と初期状態を作り直す。
     ///
-    /// `run_combo` と同じ `sequence_offset` を使うので、同じ seed なら直列実行と
-    /// ビット単位で同じ結果になる。
+    /// combo ごとに `combo_id` から決まる `sequence_offset` を使うので、同じ seed なら
+    /// 割り当て順に依らずビット単位で同じ結果になる。
     fn start_job(
         &mut self,
-        work: ComboWork,
+        params: SimParams,
         seed: u64,
         rng_stride: i32,
         n_trials: i32,
@@ -415,13 +237,14 @@ impl StreamSlot {
         setup_rng: &CudaFunction,
         init_trials: &CudaFunction,
     ) -> Result<()> {
-        let kparams = KernelParams::from_params(work.params);
-        let sequence_offset =
-            u64::from(work.params.combo_id) * 1_000_000_000 + work.trial_offset;
+        let kparams = KernelParams::from_params(params);
+        let sequence_offset = u64::from(params.combo_id) * 1_000_000_000;
         let stream = self.stream.clone();
 
-        // 前の combo の完了カウンタを0に戻してから再初期化する。
+        // 前の combo の完了カウンタとヒストグラムを0に戻してから再初期化する。
         stream.memset_zeros(&mut self.counters)?;
+        stream.memset_zeros(&mut self.hist_phi)?;
+        stream.memset_zeros(&mut self.hist_y)?;
 
         {
             let mut setup = stream.launch_builder(setup_rng);
@@ -455,7 +278,7 @@ impl StreamSlot {
         }
 
         self.job = Some(SlotJob {
-            work,
+            params,
             kparams,
             launched_steps: 0,
             last_progress: Instant::now(),
@@ -472,6 +295,7 @@ impl StreamSlot {
         rng_stride: i32,
         n_trials: i32,
         steps_per_launch: u32,
+        hist_stride: u32,
         max_steps: u64,
     ) -> Result<()> {
         let kparams = self.job.as_ref().expect("launch_sim on idle slot").kparams;
@@ -492,8 +316,11 @@ impl StreamSlot {
             step.arg(&mut self.statuses);
             step.arg(&mut self.pass_directions);
             step.arg(&mut self.counters);
+            step.arg(&mut self.hist_phi);
+            step.arg(&mut self.hist_y);
             step.arg(&n_trials);
             step.arg(&steps_per_launch);
+            step.arg(&hist_stride);
             step.arg(&max_steps);
             unsafe { step.launch(cfg) }?;
         }
@@ -506,9 +333,9 @@ impl StreamSlot {
 /// 1 GPU 上で複数 combo を CUDA stream で同時並行に処理し、queue を空にする。
 ///
 /// N=1000 の1 combo は A100 の数 SM しか埋めないため、`num_streams` 本の stream に
-/// 別々の combo を載せて占有率を上げる。物理 kernel は `run_combo` と同一で、各 trial
-/// の計算は1スレッド=1 trial のまま変えない。combo が完了した stream はすぐ次の combo を
-/// queue から取り直すので、遅い combo が GPU 全体を遊ばせ続けることもない。
+/// 別々の combo を載せて占有率を上げる。各 trial の計算は1スレッド=1 trial のまま変えない。
+/// combo が完了した stream はすぐ次の combo を queue から取り直すので、遅い combo が
+/// GPU 全体を遊ばせ続けることもない。
 ///
 /// `next_params` が `None` を返したら新規割り当てを止め、実行中の combo を全て見送って終了する。
 pub fn run_device_streamed<FNext, FProgress, FFinished>(
@@ -558,13 +385,8 @@ where
         let Some(params) = next_params() else {
             break;
         };
-        let work = ComboWork {
-            params,
-            trial_count,
-            trial_offset: 0,
-        };
         slot.start_job(
-            work,
+            params,
             config.seed,
             rng_stride,
             n_trials_i32,
@@ -586,6 +408,7 @@ where
                     rng_stride,
                     n_trials_i32,
                     config.steps_per_launch,
+                    config.hist_stride,
                     config.max_steps,
                 )?;
                 any_active = true;
@@ -609,7 +432,7 @@ where
 
             let elapsed = slot.job.as_ref().expect("active slot").last_progress.elapsed();
             if done || elapsed >= config.progress_interval {
-                let combo_id = slot.job.as_ref().expect("active slot").work.params.combo_id;
+                let combo_id = slot.job.as_ref().expect("active slot").params.combo_id;
                 on_progress(GpuProgress {
                     combo_id,
                     completed_trials: completed,
@@ -624,7 +447,7 @@ where
                 let host_times = slot.stream.clone_dtoh(&slot.times)?;
                 let host_statuses = slot.stream.clone_dtoh(&slot.statuses)?;
                 let host_pass_directions = slot.stream.clone_dtoh(&slot.pass_directions)?;
-                let params = slot.job.as_ref().expect("active slot").work.params;
+                let params = slot.job.as_ref().expect("active slot").params;
                 let summary = summarize_trials(
                     config.device_id,
                     params,
@@ -634,21 +457,29 @@ where
                     &host_statuses,
                     &host_pass_directions,
                 );
+                let trials = capture_trials(
+                    slot,
+                    config.device_id,
+                    params,
+                    trial_count,
+                    &host_times,
+                    &host_statuses,
+                    &host_pass_directions,
+                )?;
+                let hist_phi = slot.stream.clone_dtoh(&slot.hist_phi)?;
+                let hist_y = slot.stream.clone_dtoh(&slot.hist_y)?;
                 on_finished(ComboOutput {
                     summary,
-                    trials: Vec::new(),
+                    trials,
+                    hist_phi,
+                    hist_y,
                 });
 
                 // 同じバッファを使い回して次の combo を載せる。queue が空なら idle に戻す。
                 match next_params() {
                     Some(params) => {
-                        let work = ComboWork {
-                            params,
-                            trial_count,
-                            trial_offset: 0,
-                        };
                         slot.start_job(
-                            work,
+                            params,
                             config.seed,
                             rng_stride,
                             n_trials_i32,
@@ -664,6 +495,46 @@ where
     }
 
     Ok(())
+}
+
+/// 完了した combo の各 trial の初期状態・終了状態を host へ回収し、詳細結果にまとめる。
+///
+/// `times`・`statuses`・`pass_directions` は呼び出し側が既に回収済みのものを使い回す。
+fn capture_trials(
+    slot: &StreamSlot,
+    device_id: usize,
+    params: SimParams,
+    trial_count: usize,
+    host_times: &[f64],
+    host_statuses: &[i32],
+    host_pass_directions: &[i32],
+) -> Result<Vec<TrialResult>> {
+    let host_x0 = slot.stream.clone_dtoh(&slot.x0)?;
+    let host_y0 = slot.stream.clone_dtoh(&slot.y0)?;
+    let host_phi0 = slot.stream.clone_dtoh(&slot.phi0)?;
+    let host_x = slot.stream.clone_dtoh(&slot.x)?;
+    let host_y = slot.stream.clone_dtoh(&slot.y)?;
+    let host_phi = slot.stream.clone_dtoh(&slot.phi)?;
+    let host_steps = slot.stream.clone_dtoh(&slot.steps)?;
+
+    Ok((0..trial_count)
+        .map(|idx| TrialResult {
+            combo_id: params.combo_id,
+            trial_id: idx as u64,
+            device_id,
+            params,
+            x0: host_x0[idx],
+            y0: host_y0[idx],
+            phi0: host_phi0[idx],
+            x_end: host_x[idx],
+            y_end: host_y[idx],
+            phi_end: host_phi[idx],
+            t: host_times[idx],
+            steps: host_steps[idx],
+            status: host_statuses[idx],
+            pass_direction: host_pass_directions[idx],
+        })
+        .collect())
 }
 
 /// CUDA C ソースを実行時に PTX へコンパイルする。
@@ -690,9 +561,4 @@ fn launch_config_for_trials(trial_count: usize) -> LaunchConfig {
         block_dim: (CUDA_THREADS_PER_BLOCK, 1, 1),
         shared_mem_bytes: 0,
     }
-}
-
-/// 明示指定がなければ、実行モードごとの既定 trial 数を使う。
-pub fn trial_count_for_mode(mode: crate::config::RunMode, explicit: Option<usize>) -> usize {
-    explicit.unwrap_or_else(|| default_trial_count(mode))
 }
