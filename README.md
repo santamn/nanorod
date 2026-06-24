@@ -19,7 +19,7 @@ cargo build --release --features gpu
 実行したいパラメータをリストで与えると、それらの全ての組み合わせが combo として実行される。
 
 ```bash
-cargo run --release --features gpu -- \
+cargo run --release --features gpu --bin nanorod -- \
   --m 1,4,8 \
   --f 1,2,5,10 \
   --beta-pe 0.25,0.5,1.0 \
