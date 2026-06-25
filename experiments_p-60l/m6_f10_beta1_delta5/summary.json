@@ -1,0 +1,23 @@
+{
+  "combo_id": 34,
+  "device_id": 2,
+  "m": 6,
+  "l": 0.07680000000000001,
+  "beta_pe": 1.0,
+  "abs_delta_alpha_e_over_p": 5.0,
+  "f": 10.0,
+  "n_total": 1000,
+  "n_ok": 1000,
+  "n_right_passes": 997,
+  "n_left_passes": 3,
+  "n_max_steps": 0,
+  "passage_fraction": 1.0,
+  "T1": 2.2544903516,
+  "T2": 8.77100752197114,
+  "mu": 0.0443559228049171,
+  "D_eff": 0.16093438187692088,
+  "dt": 4e-7,
+  "sigma": 0.008,
+  "epsilon": 2.0,
+  "seed": 1
+}
