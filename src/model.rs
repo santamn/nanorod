@@ -303,7 +303,7 @@ pub fn wall_y_samples() -> Vec<f64> {
 
 /// 棒長から Tirado and Garcia de la Torre の補正項を計算する。
 fn tirado_terms_for_length(l: f64) -> TiradoTerms {
-    let p = 40.0 * l;
+    let p = 60.0 * l;
     let log_p = p.ln();
     let inv_p = 1.0 / p;
     let inv_p2 = inv_p * inv_p;

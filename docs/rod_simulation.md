@@ -93,7 +93,7 @@ $$
 の棒について
 
 $$
-D_0=\frac{k_B T}{8 \pi \eta L\tilde{l}_0}\left(3 \ln p_0+2 \nu_{\|,0}+\nu_{\perp,0}\right),\qquad p_0=40\tilde{l}_0
+D_0=\frac{k_B T}{8 \pi \eta L\tilde{l}_0}\left(3 \ln p_0+2 \nu_{\|,0}+\nu_{\perp,0}\right),\qquad p_0=60\tilde{l}_0
 $$
 
 として定義する。この共通の $D_0$ で全ての棒長を無次元化することで、棒長ごとに時間スケールが変わらないようにする。
@@ -125,7 +125,7 @@ $$\begin{aligned}
 \delta_{\perp} &= -0.630 + \frac{0.917}{p} - \frac{0.050}{p^2}
 \end{aligned}$$
 
-X. Yang (2019) の論文に合わせるため、 $p = 40\tilde{l}$ とする。
+Tirado らの式が妥当性を持つ範囲（おおよそ $2 < p < 30$）に収めるため、 $p = 60\tilde{l}$ とする。
 
 このとき、
 

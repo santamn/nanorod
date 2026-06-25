@@ -13,7 +13,7 @@
 - 粒子長は `l = 2m * 0.8 * sigma` とし、`m = 1, 4, 8, 15, 30` の 5 通りを使う。
 - パラメータは `l` 5 通り、`beta*qE` 6 通り、`Delta alpha*E/(q*l)` 6 通り、外力 `f` 19 通りの合計 3420 組とする。
 - 各組み合わせにつき `N = 30000` 試行、合計 102,600,000 試行を処理する。
-- 1 試行あたりの最大ステップ数は `2.5e7` とする。`dt = 4e-7` なので最大シミュレーション時刻は `10` である。
+- 1 試行あたりの最大ステップ数は `2.5e8` とする。`dt = 4e-7` なので最大シミュレーション時刻は `100` である。
 - CPU フォールバックは実装しない。GPU 初期化またはカーネル実行に失敗したら、その理由を出して停止する。
 
 ## 主要な設計方針
@@ -88,10 +88,10 @@ r_j = X + offset_j * n
 
 ### 2. 拡散係数
 
-各 `l` について `p = 40*l` とし、Tirado and Garcia de la Torre の式で `D_parallel` と `D_r` を計算する。時間スケールを棒長ごとに変えないため、標準拡散係数 `D_0` は全ての棒長で `l_ref = 6 * 0.8 * sigma = 0.0384` から計算した値を使う。仕様書の簡略化に従い、並進ノイズと `D_lab` では `D_perp = 0.5 * D_parallel` を使う。
+各 `l` について `p = 60*l` とし、Tirado and Garcia de la Torre の式で `D_parallel` と `D_r` を計算する。時間スケールを棒長ごとに変えないため、標準拡散係数 `D_0` は全ての棒長で `l_ref = 6 * 0.8 * sigma = 0.0384` から計算した値を使う。仕様書の簡略化に従い、並進ノイズと `D_lab` では `D_perp = 0.5 * D_parallel` を使う。
 
 ```text
-p_ref = 40 * l_ref
+p_ref = 60 * l_ref
 denom_ref = 3*ln(p_ref) + 2*nu_parallel(p_ref) + nu_perp(p_ref)
 D_parallel = 4 * (l_ref / l) * (ln(p) + nu_parallel(p)) / denom_ref
 D_r = 24 * l_ref * (ln(p) + delta_perp(p)) / (l^3 * denom_ref)
