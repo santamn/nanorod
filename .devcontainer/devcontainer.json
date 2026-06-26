@@ -49,9 +49,7 @@
     }
   },
   "runArgs": [
-    "--device=nvidia.com/gpu=1",
-    "--device=nvidia.com/gpu=2",
-    "--device=nvidia.com/gpu=3", 
+    "--device=nvidia.com/gpu=all",
     "--memory=60gb"
   ],
   "containerUser": "miyake",
