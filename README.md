@@ -1,101 +1,131 @@
 # nanorod
 
-流路（周期的にくびれたチャネル）中を進む棒状粒子のブラウン運動を GPU 上で数値シミュレーションし、1周期の初通過時間や移動度などを集計するプログラム。
+周期的に幅が変化する2次元チャネル内で、電気双極子の性質を持つ棒状粒子が行うブラウン運動を数値シミュレーションするプログラムです。一定の外力と一定の電場のもとで、粒子が1周期を進むまでの平均初通過時間・移動度・有効拡散係数を、GPU(CUDA)を用いた大規模アンサンブル計算で求めます。
 
-物理モデルの詳細は [docs/rod_simulation.md](docs/rod_simulation.md) を参照。
+物理モデルの詳細は [docs/rod_simulation.md](docs/rod_simulation.md) を、境界における補正については [docs/boundary_reflection.md](docs/boundary_reflection.md) を、計算機環境は [docs/architecture.md](docs/architecture.md) を参照してください。
 
-## ビルド
+## 必要環境
 
-GPU シミュレーション本体は `gpu` feature と CUDA toolkit（NVRTC / cuRAND）が必要。
+- Rust (2024 edition)
+- CUDA Toolkit 12.x と NVIDIA GPU
+  - カーネルは実行時に NVRTC で GPU の世代に合わせてコンパイルされるため、`nvcc` は不要です
+- GPU がない環境では CPU 版としてビルド可能(後述)
 
-```bash
-cargo build --release --features gpu
+用意されている [Dev Container](.devcontainer/devcontainer.json) を使うと、上記の環境がすぐに整います。
+
+## 使い方
+
+### 1. 設定ファイルを書く
+
+シミュレーションの定数はすべて TOML ファイルで指定します。リポジトリ直下の [config.toml](config.toml) が設定例です。
+
+```toml
+delta_t = 4e-7          # 時間刻み幅 Δt
+time = 100.0            # 1試行あたりの最大シミュレーション時間 T(未通過の試行はここで打ち切り)
+sigma = 8e-3            # WCA ポテンシャルの σ(壁点間隔 0.25σ・代表点間隔 0.8σ の基準)
+epsilon = 2.0           # WCA ポテンシャルの ε
+ensemble_size = 1000    # 1ケースあたりの試行数(アンサンブルサイズ)
+output_dir = "example/" # 全ケースの結果をまとめて出力するフォルダ
+
+# 以下の4つはリストで指定し、その全組み合わせ(直積)が実行される
+# gamma, delta, f は "1/3" のような分数文字列でも指定可能
+gamma = [0.25, 0.5]  # 電場トルクの永久双極子成分 γ = βpE
+delta = ["1/2", 1.0] # 電場トルクの異方性成分と永久双極子成分の比 δ = |Δα|E/p
+f = [1.0, 10.0]      # 一定外力(x方向)
+m = [1, 4]           # 棒の片側代表点数(棒長 l = 2m × 0.8σ)
+
+# hist_stride = 100  # 角度・y分布ヒストグラムへ加算するステップ間隔(0で無効、省略時100)
+
+[gpu]                  # 省略可
+# ids = [0, 1, 2, 3]  # 使用するGPUのID(省略時は全GPU)
+# tasks_per_gpu = 4   # GPUあたりの同時実行ケース数(省略時は4)
 ```
 
-実行時に NVRTC が `curand_kernel.h` などを見つけられるよう、必要に応じて環境変数 `CUDA_HOME` か `--cuda-include-path` を指定する。
+### 2. シミュレーションを実行する
 
-## 実行
-
-実行したいパラメータをリストで与えると、それらの全ての組み合わせが combo として実行される。
-
-```bash
-cargo run --release --features gpu --bin nanorod -- \
-  --m 1,4,8 \
-  --f 1,2,5,10 \
-  --beta-pe 0.25,0.5,1.0 \
-  --abs-delta-alpha-e-over-p 0.5,2.0
+```sh
+cargo run --release --features gpu                          # ./config.toml を使って全ケースを実行
+cargo run --release --features gpu -- --config sweep.toml   # 設定ファイルを指定して実行
 ```
 
-上の例では `3 × 4 × 3 × 2 = 72` combo を実行する。
+ケースは全GPUのワーカーに自動的に振り分けられ、終わったものから順に結果が書き出されます。進捗は標準エラー出力と `progress.jsonl` で確認できます。
 
-### パラメータ
+### 3. 結果を見る
 
-これらは必須で、それぞれカンマ区切りのリストとして与える。
-`f`・`beta-pe`・`abs-delta-alpha-e-over-p` は `1/3` のような分数表記も使える。
-
-| オプション | 意味 |
-| :--- | :--- |
-| `--m <M,...>` | 棒の片側代表点数 m のリスト（棒長は `l = 2m * 0.8σ`）。m ≥ 1 の整数。 |
-| `--f <F,...>` | 駆動力 f のリスト。例: `--f 1,2,1/3` |
-| `--beta-pe <B,...>` | βpE（双極子モーメント p = ql を含む電場結合の大きさ）のリスト。電場トルクに直接掛かる係数で、棒長 l に依らない。例: `--beta-pe 0.5,1/3` |
-| `--abs-delta-alpha-e-over-p <D,...>` | \|Δα\|E/p（電場トルクの異方性成分と永久双極子成分の比）のリスト。トルクは補足資料 式(8) の `τ_E = βpE·cosφ·(1 − (\|Δα\|E/p)·sinφ)` で、正の値ほど棒を y 軸から横へ倒す効果が強くなる（1 を超えると傾いた配向が安定）。例: `--abs-delta-alpha-e-over-p 1,2,3` |
-
-同じ値を重複して与えても、combo は重複しないよう自動的に1つにまとめられる。
-
-### 実行制御オプション
-
-| オプション | 既定値 | 意味 |
-| :--- | :--- | :--- |
-| `--output-dir <DIR>` | `output` | 結果を書き出すルートディレクトリ。既存のディレクトリには上書きせず、新規でなければエラーになる。 |
-| `--devices <ID,...>` | `0,1,2` | 使用する GPU デバイス番号。 |
-| `--trials <N>` | `1000` | 1 combo あたりの試行回数。 |
-| `--streams <N>` | `16` | 各 GPU が同時並行に処理する combo 数（= CUDA stream 数）。占有率を上げるための値で、A100 では約16で飽和する。 |
-| `--max-steps <N>` | `250000000` | 1 試行あたりの最大ステップ数。これを超えた試行は未通過として集計から除外する。 |
-| `--steps-per-launch <N>` | `10000` | 1 回の kernel 起動で進めるステップ数。 |
-| `--hist-stride <N>` | `100` | 角度・y分布ヒストグラムへ加算するステップ間隔。`0` で記録を無効にする。 |
-| `--seed <N>` | `1` | 乱数シード。combo ごとに決まる系列オフセットと組み合わせて再現性を保つ。 |
-| `--progress-interval-sec <N>` | `5` | 進捗を `progress.jsonl` に書き出す間隔（秒）。 |
-| `--cuda-include-path <PATH>` | （なし） | NVRTC に渡す追加 include パス。複数指定可。 |
-| `--cuda-arch <ARCH>` | `compute_80` | NVRTC の `--gpu-architecture`。 |
-
-## 出力
-
-`--output-dir` の下に、combo ごとのサブフォルダが作られる。フォルダ名はパラメータから決まる:
+`output_dir` に次の構造で出力されます。
 
 ```
-output/
-├── progress.jsonl                 # 全 combo 共通の進捗ログ（1 行 1 イベント）
-├── m1_f1_beta0.25_delta0.5/
-│   ├── summary.json               # この combo の集計結果
-│   ├── trials.csv                 # 各試行の初期状態・終了状態・初通過時間
+example/
+├── config.toml                    # 使用した設定ファイルのコピー(再現用)
+├── progress.jsonl                 # 進捗ログ(1行1イベントのJSON)
+├── m1_f1_gamma0.25_delta0.5/      # ケースごとのフォルダ(m{m}_f{f}_gamma{γ}_delta{δ})
+│   ├── summary.json               # このケースの集計結果
+│   ├── trials.csv                 # 全試行の初期状態・終了状態・初通過時間
 │   ├── angle_hist.csv             # (x × φ) の角度分布ヒストグラム
 │   └── y_hist.csv                 # (x × y) の y 分布ヒストグラム
-├── m1_f2_beta0.25_delta0.5/
+├── m1_f1_gamma0.25_delta1/
 │   └── ...
 └── ...
 ```
 
-フォルダ名は `m{m}_f{f}_beta{beta}_delta{delta}` の形式で、数値は末尾の余分なゼロを落として表記する（例: `1/3` は `0.333333`、`0` は `0`）。
-
-### `summary.json` の主な項目
+`summary.json` の主な項目:
 
 | 項目 | 意味 |
-| :--- | :--- |
-| `n_total` / `n_ok` | 総試行数 / 初通過した試行数 |
-| `n_right_passes` / `n_left_passes` | 右方向 / 左方向へ1周期通過した試行数 |
-| `n_max_steps` | 最大ステップ数に達して未通過だった試行数 |
-| `passage_fraction` | `n_ok / n_total` |
-| `T1` / `T2` | 平均初通過時間 / その2乗平均 |
-| `mu` | 移動度 μ = v/f（v = L/T1 は1周期あたりの平均速度）。`f = 0` では定義できず `NaN`。 |
-| `D_eff` | 有効拡散係数 |
+| --- | --- |
+| `n_ok` / `n_total` | 1周期を通過した試行数 / 総試行数 |
+| `n_right_passes` / `n_left_passes` | 右 / 左方向へ通過した試行数 |
+| `n_max_steps` | 時間 T までに未通過だった試行数(平均の計算から除外) |
+| `T1` / `T2` | 平均初通過時間 T₁ とその2乗平均 T₂ |
+| `mu` | 移動度 μ = v / f(v = L/T₁ は1周期あたりの平均速度。f = 0 では `null`) |
+| `D_eff` | 有効拡散係数 D_eff = L²(T₂ − T₁²) / 2T₁³ |
 
-### 角度・y分布ヒストグラム
+各ケースの乱数シードはパラメータの組から決定論的に導出されるため、同じ設定ファイルからは GPU への割り当て順序に依らず、常にビット単位で同じ結果が得られます。
 
-`angle_hist.csv` と `y_hist.csv` は、通過途中の棒の状態を `--hist-stride` ステップごとにGPU上で集計した2次元ヒストグラム。combo 内の全試行・全ステップにわたって占有時間で重み付けされた分布で、`x, phi, count`（または `x, y, count`）のtidy 形式で出力される。
+`angle_hist.csv` / `y_hist.csv` は、通過途中の棒の状態を `hist_stride` ステップごとに集計した占有時間重み付きの2次元ヒストグラムで、`x, phi, count`(または `x, y, count`)の tidy 形式です。`x` で pivot すると x 座標ごとの角度分布・y 分布が得られます。y は各 x の壁位置 ±ω(x) で正規化すると、y 方向に一様に達しているかを確認できます。
 
-- `x` は1周期 `[0, 1)` に畳んだ位置の bin 中心（くびれは既知の位相に対応）
-- `phi` は `[0, 2π)` に巻き戻した角度の bin 中心
-- `y` は `[-2.3, 2.3]` を等分した bin 中心。
-  - 各 `x` における壁位置は `±omega(x)` で計算できるので、`y` を壁位置で正規化すれば「y方向に一様（平行）に達しているか」を確認できる。
+### 4. アニメーションを見る
 
-解析時は `x` で pivot すれば、x 座標ごとの角度分布・y分布が得られる。
+```sh
+cargo run --release -- animate
+```
+
+1粒子の運動をリアルタイムに描画します。初期パラメータには設定ファイルの各リスト(m, f, gamma, delta)の先頭値が使われます。
+
+- **seed / m / f / γ / δ は GUI で変更可能**: f, γ, δ は実行中の粒子に即座に反映され、m は変更した瞬間に、seed は「リセット」ボタンを押したときに初期状態から反映されます
+- 粒子(棒)・重心の軌跡・初期位置(青線)・左右の通過判定位置(緑線・赤線)が表示されます
+
+## CPU版としてのビルド
+
+GPU がないマシンでは、同じ物理モデルの CPU 実装(rayon 並列)で動かせます。GPU 版に比べ桁違いに遅いため、小規模な動作確認・検証用です。`gpu` フィーチャーを付けずにビルドすると CPU 版になります。
+
+```sh
+cargo run --release
+```
+
+乱数生成器だけが GPU 版(cuRAND Philox)と異なるため、結果は統計的には同等ですがビット単位では一致しません。
+
+## プロジェクト構成
+
+```
+src/
+├── main.rs           # CLI(run / animate サブコマンド)
+├── config.rs         # TOML設定の読み込みとケース(直積)への展開
+├── model.rs          # 共有の物理数式と集計(流路形状・境界反射・拡散係数)
+├── simulation.rs     # 物理モデルのCPU実装(アニメーションとCPU版で使用)
+├── runner.rs         # 全ケースの実行と結果の書き出し(GPU/CPUバックエンド)
+├── renderer.rs       # アニメーション表示(egui/eframe)
+├── gpu.rs            # GPUバックエンド(NVRTC・CUDA stream 管理)
+└── kernels/
+    └── simulation.cu # 物理モデルのGPU実装(CUDAカーネル)
+docs/
+├── rod_simulation.md      # 物理モデルの導出と定式化
+├── boundary_reflection.md # 境界外状態の鏡映補正
+└── architecture.md        # 実行マシンのハードウェア構成
+```
+
+## 性能メモ(NVIDIA A100 での実測)
+
+- 1 step の計算コストは棒の代表点数 2m+1 にほぼ比例し、飽和スループットは A100 1枚あたり約 **2.6〜2.7×10⁹ 代表点ステップ/s**(m=1 で約 9×10⁸ steps/s、m=30 で約 4.3×10⁷ steps/s)
+- 1ケースだけでは GPU を使い切れないため、**`tasks_per_gpu` 本の CUDA stream で複数ケースを同時実行**して占有率を上げています。同時に走る試行数 `ensemble_size × tasks_per_gpu` が **10万程度に達するまでスループットはほぼ線形**に伸びます:
+  - `ensemble_size = 30000` なら既定の 4 ケース同時で飽和値の約85%、8 でほぼ飽和
+  - `ensemble_size = 1000` のような小さいアンサンブルでは `tasks_per_gpu` を 32〜96 に上げると数倍速くなります

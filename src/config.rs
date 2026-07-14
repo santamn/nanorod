@@ -1,24 +1,28 @@
-use std::path::PathBuf;
+//! TOML 設定ファイルの読み込みと、シミュレーションケースへの展開。
+//!
+//! シミュレーションの設定値はすべて TOML ファイルで指定する。掃引するパラメータ
+//! （γ, δ, f, m）はリストで与え、その直積を「ケース」として展開する。
 
-use clap::Parser;
+use std::path::{Path, PathBuf};
 
-// シミュレーション全体で共有する無次元化済みの物理定数。
+use anyhow::{Context, Result, ensure};
+use serde::{Deserialize, Deserializer};
+
+use crate::model::diffusion_for_length;
+
+// ---- モデルの形そのものから決まる、設定ファイルでは変更しない定数 ----
+
+/// 流路の周期長。全ての長さはこの周期で無次元化されているため常に 1。
 pub const L_PERIOD: f64 = 1.0;
-pub const EPSILON: f64 = 2.0;
-pub const SIGMA: f64 = 8.0e-3;
-pub const DT: f64 = 4.0e-7;
-pub const WALL_DX: f64 = 0.25 * SIGMA;
-pub const PARTICLE_DX: f64 = 0.8 * SIGMA;
-/// 全ての棒長で同じ時間スケールを使うため、D_0 の計算にだけ使う基準棒長。
-pub const DIFFUSION_REFERENCE_LENGTH: f64 = 6.0 * PARTICLE_DX;
-pub const N_WALL: usize = (L_PERIOD / WALL_DX) as usize;
-pub const WALL_K: i32 = 5;
+/// 1つの粒子代表点が1つの壁点から受ける反発力の大きさの上限（仕様で固定）。
 pub const MAX_WALL_REPULSION_FORCE: f64 = 2.5e4;
+/// 境界外に出た状態を鏡像反射で流路内へ戻す最大反復回数。
 pub const BOUNDARY_REFLECTION_LIMIT: usize = 32;
+/// 流路のくびれ（omega(x) が最小になる点）の位相。omega の形だけで決まる。
 pub const CHANNEL_NECK_PHASE: f64 = 0.809_640_837_312_333_2;
-pub const RNG_STATE_BYTES: usize = 256;
-pub const DEFAULT_MAX_STEPS: u64 = 250_000_000; // 2.5 × 10^8
-pub const DEFAULT_TRIALS: usize = 1000;
+/// 壁近傍探索で左右に見る壁点数 K = ceil(r_c / Δx_wall) = ceil(4·2^(1/6)) = 5。
+/// r_c と Δx_wall はどちらも σ に比例するため、σ の値に依らない定数になる。
+pub const WALL_K: i32 = 5;
 
 // 角度・y分布ヒストグラムの解像度と範囲。GPU kernel と CSV 出力で共有する。
 // x は1周期 [0,1) に畳み、φ は [0,2π) に巻き戻し、y は [-Y_MAX, Y_MAX] に収める。
@@ -27,190 +31,351 @@ pub const HIST_PHI_BINS: usize = 36;
 pub const HIST_Y_BINS: usize = 64;
 /// y ヒストグラムの片側範囲。流路半幅 omega(x) の最大値（≈2.18）を覆う値にしておく。
 pub const HIST_Y_MAX: f64 = 2.3;
-/// 何ステップごとにヒストグラムへ加算するかの既定値。
-pub const DEFAULT_HIST_STRIDE: u32 = 100;
 
-/// コマンドライン引数。
-///
-/// 掃引するパラメータ（m, f, βpE, |Δα|E/p）はリストで与え、それらの直積を
-/// combo として実行する。各 combo の結果は `output_dir` の下の専用フォルダへ保存する。
-#[derive(Debug, Parser)]
-#[command(
-    version,
-    about = "GPU simulation for Brownian motion of rod-like particles"
-)]
-pub struct Cli {
-    /// 結果を書き出すルートディレクトリ。combo ごとにこの下へサブフォルダを作る。
-    #[arg(long, default_value = "output")]
-    pub output_dir: PathBuf,
-
-    /// 使用する GPU デバイス番号（カンマ区切り）。
-    #[arg(long, value_delimiter = ',', default_value = "0,1,2")]
-    pub devices: Vec<usize>,
-
-    /// 1 combo あたりの試行回数。
-    #[arg(long, default_value_t = DEFAULT_TRIALS)]
-    pub trials: usize,
-
-    /// 棒の片側代表点数 m のリスト（カンマ区切り）。
-    #[arg(long, value_delimiter = ',', required = true)]
-    pub m: Vec<i32>,
-
-    /// 駆動力 f のリスト。`1/3` のような分数も受け付ける。
-    #[arg(long = "f", value_delimiter = ',', value_parser = parse_ratio, required = true)]
-    pub f: Vec<f64>,
-
-    /// βpE（双極子モーメント p = ql を含む電場結合の大きさ）のリスト。`1/3` のような分数も受け付ける。
-    #[arg(long = "beta-pe", value_delimiter = ',', value_parser = parse_ratio, required = true)]
-    pub beta_pe: Vec<f64>,
-
-    /// |Δα|E/p（電場トルクの異方性成分と永久双極子成分の比）のリスト。`1/3` のような分数も受け付ける。
-    ///
-    /// 補足資料 式(8) の形 τ_E = βpE·cosφ·(1 − (|Δα|E/p)·sinφ) で用い、正の値ほど棒を
-    /// y 軸から横へ倒す効果が強くなる（1 を超えると傾いた配向が安定になる）。
-    #[arg(long = "abs-delta-alpha-e-over-p", value_delimiter = ',', value_parser = parse_ratio, required = true)]
-    pub abs_delta_alpha_e_over_p: Vec<f64>,
-
-    #[arg(long, default_value_t = DEFAULT_MAX_STEPS)]
-    pub max_steps: u64,
-
-    #[arg(long, default_value_t = 10_000)]
-    pub steps_per_launch: u32,
-
-    /// 角度・y分布ヒストグラムへ加算するステップ間隔。0 で記録を無効にする。
-    #[arg(long, default_value_t = DEFAULT_HIST_STRIDE)]
-    pub hist_stride: u32,
-
-    /// 各 GPU が同時並行に処理する combo 数（=CUDA stream 数）。
-    ///
-    /// N=1000 では1 combo が A100 の数 SM しか使わないため、複数 combo を
-    /// 並行させて占有率を上げる。約16でA100が飽和する（measured knee）。
-    #[arg(long, default_value_t = 16)]
-    pub streams: usize,
-
-    #[arg(long, default_value_t = 1)]
-    pub seed: u64,
-
-    #[arg(long, default_value_t = 5)]
-    pub progress_interval_sec: u64,
-
-    #[arg(long)]
-    pub cuda_include_path: Vec<String>,
-
-    #[arg(long, default_value = "compute_80")]
-    pub cuda_arch: String,
+/// `hist_stride` を省略したときの既定値（100 ステップごとに1票）。
+fn default_hist_stride() -> u32 {
+    100
 }
 
-/// `a/b` の分数表記と通常の小数表記の両方を f64 として解釈する。
+/// TOML 形式の設定ファイルに対応する構造体。
 ///
-/// `1/3` のように割り切れない値もコマンドラインから直接与えられるようにする。
-fn parse_ratio(text: &str) -> Result<f64, String> {
-    let text = text.trim();
+/// `gamma`, `delta`, `f`, `m` はリストで指定し、その全組み合わせ（直積）が
+/// ケースとしてシミュレーションされる。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Config {
+    /// 時間刻み幅 Δt。
+    pub delta_t: f64,
+    /// 1試行あたりの最大シミュレーション時間 T。未通過の試行はここで打ち切る。
+    pub time: f64,
+    /// 1ケースあたりの試行数（アンサンブルサイズ）。
+    pub ensemble_size: usize,
+    /// 全ケースの結果をまとめて出力するフォルダ。
+    pub output_dir: PathBuf,
+    /// WCA ポテンシャルの σ。壁点間隔 0.25σ・代表点間隔 0.8σ の基準にもなる。
+    pub sigma: f64,
+    /// WCA ポテンシャルの ε。
+    pub epsilon: f64,
+    /// 電場トルクの永久双極子成分の大きさ γ = βpE のリスト（"1/3" のような分数表記も可）。
+    #[serde(deserialize_with = "deserialize_frac_vec")]
+    pub gamma: Vec<f64>,
+    /// 電場トルクの異方性成分と永久双極子成分の比 δ = |Δα|E/p のリスト（分数表記も可）。
+    #[serde(deserialize_with = "deserialize_frac_vec")]
+    pub delta: Vec<f64>,
+    /// x 方向の一定外力 f のリスト（分数表記も可）。
+    #[serde(deserialize_with = "deserialize_frac_vec")]
+    pub f: Vec<f64>,
+    /// 棒の片側代表点数 m のリスト。棒長は l = 2m × 0.8σ。
+    pub m: Vec<i32>,
+    /// 角度・y分布ヒストグラムへ加算するステップ間隔。0 で記録を無効化（省略時 100）。
+    #[serde(default = "default_hist_stride")]
+    pub hist_stride: u32,
+    /// GPU 実行に関する設定（省略可）。
+    #[serde(default)]
+    #[cfg_attr(not(feature = "gpu"), allow(dead_code))] // CPU ビルドでは参照されない
+    pub gpu: GpuConfig,
+}
 
-    let value = if let Some((numerator, denominator)) = text.split_once('/') {
-        let numerator: f64 = numerator
-            .trim()
-            .parse()
-            .map_err(|_| format!("invalid numerator in `{text}`"))?;
-        let denominator: f64 = denominator
-            .trim()
-            .parse()
-            .map_err(|_| format!("invalid denominator in `{text}`"))?;
-        if denominator == 0.0 {
-            return Err(format!("division by zero in `{text}`"));
+/// GPU 実行に関する任意設定。
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(not(feature = "gpu"), allow(dead_code))] // CPU ビルドでは参照されない
+pub struct GpuConfig {
+    /// 使用する GPU の ID（省略時は搭載されている全 GPU）。
+    pub ids: Option<Vec<usize>>,
+    /// 1つの GPU で同時に実行するケース数（省略時は 4）。
+    pub tasks_per_gpu: Option<usize>,
+}
+
+impl Config {
+    /// TOML ファイルを読み込み、値の妥当性を検証する。
+    pub fn load(path: &Path) -> Result<Self> {
+        let text = std::fs::read_to_string(path)
+            .with_context(|| format!("設定ファイル {} を読み込めません", path.display()))?;
+        let config: Config = toml::from_str(&text)
+            .with_context(|| format!("設定ファイル {} の形式が不正です", path.display()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// 各設定値の範囲と、σ・m から導かれる幾何・拡散係数の健全性を検証する。
+    fn validate(&self) -> Result<()> {
+        ensure!(
+            self.delta_t.is_finite() && self.delta_t > 0.0,
+            "delta_t は正の値にしてください"
+        );
+        ensure!(
+            self.time.is_finite() && self.time > 0.0,
+            "time は正の値にしてください"
+        );
+        ensure!(
+            self.time / self.delta_t >= 1.0,
+            "time / delta_t が1ステップに満たない設定です"
+        );
+        ensure!(
+            self.ensemble_size >= 1 && self.ensemble_size <= i32::MAX as usize,
+            "ensemble_size は 1 以上 {} 以下にしてください",
+            i32::MAX
+        );
+        ensure!(
+            self.sigma.is_finite() && self.sigma > 0.0,
+            "sigma は正の値にしてください"
+        );
+        ensure!(
+            self.epsilon.is_finite() && self.epsilon > 0.0,
+            "epsilon は正の値にしてください"
+        );
+
+        for (name, list) in [
+            ("gamma", &self.gamma),
+            ("delta", &self.delta),
+            ("f", &self.f),
+        ] {
+            ensure!(!list.is_empty(), "{name} には1つ以上の値を指定してください");
+            ensure!(
+                list.iter().all(|v| v.is_finite()),
+                "{name} に有限でない値が含まれています"
+            );
         }
-        numerator / denominator
-    } else {
-        text.parse()
-            .map_err(|_| format!("`{text}` is not a number"))?
+        ensure!(!self.m.is_empty(), "m には1つ以上の値を指定してください");
+        for &m in &self.m {
+            ensure!(m >= 1, "m は1以上にしてください（{m} が指定されました）");
+        }
+
+        // σ から壁点数が整数として定まり、近傍探索窓が1周期に収まることを確認する。
+        let physics = self.physics()?;
+
+        // Tirado の式は棒のアスペクト比が小さすぎると負の拡散係数を返すため、
+        // 全ての m で拡散係数が正になることを事前に確認する。
+        for &m in &self.m {
+            let l = physics.particle_length(m);
+            let diffusion = diffusion_for_length(l, physics.diffusion_reference_length);
+            ensure!(
+                diffusion.d_parallel > 0.0 && diffusion.d_perp > 0.0 && diffusion.d_r > 0.0,
+                "m = {m}（棒長 l = {l:.6}）は拡散係数の式（Tirado）の適用範囲外です。\
+                 sigma または m を見直してください"
+            );
+        }
+        Ok(())
+    }
+
+    /// 設定から全ケース共通の物理定数一式を導出する。
+    pub fn physics(&self) -> Result<Physics> {
+        let wall_dx = 0.25 * self.sigma;
+        let n_wall_exact = L_PERIOD / wall_dx;
+        let n_wall = n_wall_exact.round();
+        // 壁点は k mod N_wall で周期参照するため、1周期がちょうど N_wall 分割でなければならない。
+        ensure!(
+            (n_wall_exact - n_wall).abs() <= 1.0e-6 * n_wall,
+            "1周期が壁点間隔 0.25σ で割り切れません（L / 0.25σ = {n_wall_exact}）。\
+             sigma には 1 / (0.25σ) が整数になる値を指定してください"
+        );
+        let min_wall = f64::from(2 * WALL_K + 1);
+        ensure!(
+            n_wall >= min_wall && n_wall <= f64::from(i32::MAX),
+            "壁点数 {n_wall} が近傍探索窓（{min_wall} 点）に対して少なすぎるか多すぎます"
+        );
+
+        let particle_dx = 0.8 * self.sigma;
+        Ok(Physics {
+            delta_t: self.delta_t,
+            max_steps: (self.time / self.delta_t).round() as u64,
+            sigma: self.sigma,
+            epsilon: self.epsilon,
+            wall_dx,
+            particle_dx,
+            n_wall: n_wall as usize,
+            diffusion_reference_length: 6.0 * particle_dx,
+        })
+    }
+
+    /// パラメータリストの全組み合わせ（直積）をケースとして展開する。
+    ///
+    /// 列挙順は m → γ → δ → f の入れ子で、`case_id` を 0 から振る。
+    /// 同じ値が重複して与えられても、ケース（と出力フォルダ）が二重にならないよう
+    /// 各リストを出現順を保ったまま重複排除する。
+    pub fn cases(&self) -> Result<Vec<Case>> {
+        let physics = self.physics()?;
+        let m_values = dedup_in_order_i32(&self.m);
+        let gamma_values = dedup_in_order_f64(&self.gamma);
+        let delta_values = dedup_in_order_f64(&self.delta);
+        let f_values = dedup_in_order_f64(&self.f);
+
+        let mut cases = Vec::with_capacity(
+            m_values.len() * gamma_values.len() * delta_values.len() * f_values.len(),
+        );
+        for &m in &m_values {
+            for &gamma in &gamma_values {
+                for &delta in &delta_values {
+                    for &f in &f_values {
+                        cases.push(Case {
+                            case_id: cases.len() as u32,
+                            m,
+                            l: physics.particle_length(m),
+                            gamma,
+                            delta,
+                            f,
+                        });
+                    }
+                }
+            }
+        }
+
+        // フォルダ名は小数点以下6桁へ丸めるため、それより近い値同士は出力先が衝突する。
+        // 実行後に気づくと結果が失われかねないので、展開時点で検出して止める。
+        let mut names = std::collections::HashSet::with_capacity(cases.len());
+        for case in &cases {
+            ensure!(
+                names.insert(case.dir_name()),
+                "ケースの出力フォルダ名 {} が重複します。パラメータ値の差が小さすぎて \
+                 小数点以下6桁の表記で区別できません",
+                case.dir_name()
+            );
+        }
+        Ok(cases)
+    }
+}
+
+/// 設定から導出した、全ケース共通の物理定数と数値パラメータ。
+#[derive(Clone, Copy, Debug)]
+pub struct Physics {
+    /// 時間刻み幅 Δt。
+    pub delta_t: f64,
+    /// 1試行の最大ステップ数 round(time / Δt)。未通過の試行はここで打ち切る。
+    pub max_steps: u64,
+    /// WCA ポテンシャルの σ。
+    pub sigma: f64,
+    /// WCA ポテンシャルの ε。
+    pub epsilon: f64,
+    /// 壁のサンプリング点間隔 0.25σ。
+    pub wall_dx: f64,
+    /// 棒の代表点間隔 0.8σ。
+    pub particle_dx: f64,
+    /// 1周期あたりの壁サンプリング点数 L / (0.25σ)。
+    pub n_wall: usize,
+    /// D_0 の計算にだけ使う基準棒長 6 × 0.8σ。全棒長で同じ時間スケールを使うための固定値。
+    pub diffusion_reference_length: f64,
+}
+
+impl Physics {
+    /// WCA カットオフ半径の2乗 r_c² = (2^(1/6)σ)² = 2^(1/3)σ²。
+    pub fn rc2(&self) -> f64 {
+        2.0_f64.cbrt() * self.sigma * self.sigma
+    }
+
+    /// 代表点間隔と m から棒長 l = 2m × 0.8σ を求める。
+    pub fn particle_length(&self, m: i32) -> f64 {
+        2.0 * f64::from(m) * self.particle_dx
+    }
+}
+
+/// 1回のシミュレーションに対応するパラメータの組。
+#[derive(Clone, Copy, Debug)]
+pub struct Case {
+    /// 展開順に 0 から振られる通し番号。出力の対応付けに使う。
+    pub case_id: u32,
+    /// 棒の片側代表点数。代表点は全体で 2m+1 個。
+    pub m: i32,
+    /// 棒長 l = 2m × 0.8σ。
+    pub l: f64,
+    /// 電場トルクの永久双極子成分の大きさ γ = βpE（p = ql を含む結合の大きさそのもの）。
+    pub gamma: f64,
+    /// 電場トルクの異方性成分と永久双極子成分の比 δ = |Δα|E/p。正で棒を横へ倒す効果を生む。
+    pub delta: f64,
+    /// x 方向の一定外力 f。
+    pub f: f64,
+}
+
+impl Case {
+    /// 結果を保存するサブフォルダ名（例: `m3_f10_gamma1_delta0.333333`）。
+    pub fn dir_name(&self) -> String {
+        format!(
+            "m{}_f{}_gamma{}_delta{}",
+            self.m,
+            format_param(self.f),
+            format_param(self.gamma),
+            format_param(self.delta),
+        )
+    }
+
+    /// パラメータの組から再現性のある乱数シードを導出する（FNV-1a ハッシュ）。
+    ///
+    /// 実行順序や GPU への割り当てに依存せず、同じパラメータには常に同じシードが
+    /// 与えられるため、同じ設定ファイルからは常に同じ結果が得られる。
+    pub fn seed(&self) -> u64 {
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for bits in [
+            self.m as u64,
+            self.gamma.to_bits(),
+            self.delta.to_bits(),
+            self.f.to_bits(),
+        ] {
+            hash ^= bits;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        hash
+    }
+}
+
+/// 数値または "1/3" のような分数文字列のリストを f64 のリストにデシリアライズする。
+fn deserialize_frac_vec<'de, D>(deserializer: D) -> Result<Vec<f64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum FracValue {
+        Number(f64),
+        Text(String),
+    }
+
+    Vec::<FracValue>::deserialize(deserializer)?
+        .into_iter()
+        .map(|value| match value {
+            FracValue::Number(number) => Ok(number),
+            FracValue::Text(text) => parse_fraction(&text).map_err(serde::de::Error::custom),
+        })
+        .collect()
+}
+
+/// "分子/分母" 形式、または通常の数値文字列を f64 に変換する。
+fn parse_fraction(text: &str) -> Result<f64, String> {
+    let value = match text.split_once('/') {
+        Some((numerator, denominator)) => {
+            let numerator: f64 = numerator
+                .trim()
+                .parse()
+                .map_err(|_| format!("不正な分数表記です: \"{text}\""))?;
+            let denominator: f64 = denominator
+                .trim()
+                .parse()
+                .map_err(|_| format!("不正な分数表記です: \"{text}\""))?;
+            if denominator == 0.0 {
+                return Err(format!("分母が0の分数です: \"{text}\""));
+            }
+            numerator / denominator
+        }
+        None => text
+            .trim()
+            .parse()
+            .map_err(|_| format!("不正な数値です: \"{text}\""))?,
     };
 
-    if !value.is_finite() {
-        return Err(format!("`{text}` is not a finite number"));
+    if !f64::is_finite(value) {
+        return Err(format!("有限の数値ではありません: \"{text}\""));
     }
     Ok(value)
 }
 
-/// 1つのパラメータ組み合わせ。
-///
-/// `m` は棒の片側代表点数で、実際の棒長は `l = 2m * 0.8sigma`。
-#[derive(Clone, Copy, Debug)]
-pub struct SimParams {
-    pub combo_id: u32,
-    pub m: i32,
-    pub l: f64,
-    /// 電場トルクの永久双極子成分の大きさ βpE（= pE、p = ql）。トルクに直接掛かる係数。
-    pub beta_pe: f64,
-    /// 電場トルクの異方性成分と永久双極子成分の比 |Δα|E/p。正で棒を横へ倒す効果を生む。
-    pub abs_delta_alpha_e_over_p: f64,
-    pub force: f64,
-}
-
-/// 代表点間隔 `0.8sigma` と `m` から棒長 `l` を求める。
-pub fn particle_length(m: i32) -> f64 {
-    2.0 * f64::from(m) * PARTICLE_DX
-}
-
-/// CLI で与えられた各パラメータのリストから、その直積を combo として列挙する。
-///
-/// 列挙順は m → βpE → |Δα|E/p → f の入れ子で、`combo_id` を 0 から振り直す。
-/// 同じ値が重複して与えられても、combo が二重にならないよう各リストを重複排除する。
-pub fn parameter_combinations(
-    m_values: &[i32],
-    beta_pe_values: &[f64],
-    abs_delta_alpha_e_over_p_values: &[f64],
-    force_values: &[f64],
-) -> anyhow::Result<Vec<SimParams>> {
-    for &m in m_values {
-        anyhow::ensure!(m >= 1, "m must be at least 1, got {m}");
-    }
-
-    let m_values = dedup_in_order_i32(m_values);
-    let beta_pe_values = dedup_in_order_f64(beta_pe_values);
-    let delta_values = dedup_in_order_f64(abs_delta_alpha_e_over_p_values);
-    let force_values = dedup_in_order_f64(force_values);
-
-    let mut combos = Vec::with_capacity(
-        m_values.len() * beta_pe_values.len() * delta_values.len() * force_values.len(),
-    );
-
-    for &m in &m_values {
-        for &beta_pe in &beta_pe_values {
-            for &abs_delta_alpha_e_over_p in &delta_values {
-                for &force in &force_values {
-                    combos.push(SimParams {
-                        combo_id: combos.len() as u32,
-                        m,
-                        l: particle_length(m),
-                        beta_pe,
-                        abs_delta_alpha_e_over_p,
-                        force,
-                    });
-                }
-            }
-        }
-    }
-
-    anyhow::ensure!(!combos.is_empty(), "no parameter combinations to run");
-    Ok(combos)
-}
-
-/// combo の物理パラメータから、結果を保存するサブフォルダ名を作る。
-pub fn combo_dir_name(params: &SimParams) -> String {
-    format!(
-        "m{}_f{}_beta{}_delta{}",
-        params.m,
-        format_param(params.force),
-        format_param(params.beta_pe),
-        format_param(params.abs_delta_alpha_e_over_p),
-    )
-}
-
-/// フォルダ名用に f64 を、末尾の余分なゼロを落とした短い文字列へ整形する。
+/// フォルダ名用に f64 を、小数点以下6桁へ丸めて末尾の余分な0を落とした短い文字列へ整形する。
 fn format_param(value: f64) -> String {
     let text = format!("{value:.6}");
     let trimmed = text.trim_end_matches('0').trim_end_matches('.');
-    trimmed.to_string()
+    if trimmed.is_empty() || trimmed == "-" {
+        "0".to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// i32 のリストを、出現順を保ったまま重複排除する。
@@ -235,92 +400,142 @@ fn dedup_in_order_f64(values: &[f64]) -> Vec<f64> {
     unique
 }
 
-/// 少なくとも1つの GPU デバイスが指定されていることを確認する。
-pub fn validate_devices(devices: &[usize]) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        !devices.is_empty(),
-        "at least one GPU device must be specified"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parameter_combinations_form_cartesian_product() {
-        let combos =
-            parameter_combinations(&[1, 4], &[0.25, 0.5], &[1.0], &[1.0, 2.0, 3.0]).unwrap();
+    /// テスト用の最小設定を返す。
+    fn minimal_config_text() -> &'static str {
+        r#"
+delta_t = 4e-7
+time = 100.0
+ensemble_size = 1000
+output_dir = "example/"
+sigma = 8e-3
+epsilon = 2.0
+gamma = [0.25, "1/2"]
+delta = ["1/3"]
+f = [1.0, 2.0, 3.0]
+m = [1, 4]
+"#
+    }
 
-        #[allow(clippy::identity_op)]
-        {
-            assert_eq!(combos.len(), 2 * 2 * 1 * 3);
-        }
-        // combo_id は 0 から連番で振られる。
-        assert_eq!(combos.first().unwrap().combo_id, 0);
-        assert_eq!(combos.last().unwrap().combo_id, 11);
+    #[test]
+    fn config_parses_fractions_and_defaults() {
+        let config: Config = toml::from_str(minimal_config_text()).unwrap();
+        config.validate().unwrap();
+
+        assert_eq!(config.gamma, vec![0.25, 0.5]);
+        assert!((config.delta[0] - 1.0 / 3.0).abs() < 1.0e-15);
+        assert_eq!(config.hist_stride, 100);
+        assert!(config.gpu.ids.is_none());
+        assert!(config.gpu.tasks_per_gpu.is_none());
+    }
+
+    #[test]
+    fn config_rejects_unknown_keys() {
+        let text = format!("{}\nunknown_key = 1.0\n", minimal_config_text());
+        assert!(toml::from_str::<Config>(&text).is_err());
+    }
+
+    #[test]
+    fn physics_derives_wall_geometry_from_sigma() {
+        let config: Config = toml::from_str(minimal_config_text()).unwrap();
+        let physics = config.physics().unwrap();
+
+        assert_eq!(physics.n_wall, 500);
+        assert!((physics.wall_dx - 0.002).abs() < 1.0e-15);
+        assert!((physics.particle_dx - 0.0064).abs() < 1.0e-15);
+        assert!((physics.diffusion_reference_length - 0.0384).abs() < 1.0e-15);
+        assert_eq!(physics.max_steps, 250_000_000);
+        assert!((physics.rc2() - 2.0_f64.cbrt() * 8.0e-3 * 8.0e-3).abs() < 1.0e-18);
+    }
+
+    #[test]
+    fn physics_rejects_sigma_with_non_integer_wall_count() {
+        let text = minimal_config_text().replace("sigma = 8e-3", "sigma = 7.7e-3");
+        let config: Config = toml::from_str(&text).unwrap();
+        assert!(config.physics().is_err());
+    }
+
+    #[test]
+    fn cases_form_cartesian_product_in_declared_order() {
+        let config: Config = toml::from_str(minimal_config_text()).unwrap();
+        let cases = config.cases().unwrap();
+
+        // m(2) × γ(2) × δ(1) × f(3) の直積。
+        assert_eq!(cases.len(), 2 * 2 * 3);
+        assert_eq!(cases.first().unwrap().case_id, 0);
+        assert_eq!(cases.last().unwrap().case_id, 11);
         // 入れ子の最内は f なので、先頭2要素は f だけが変わる。
-        assert_eq!(combos[0].m, 1);
-        assert_eq!(combos[0].force, 1.0);
-        assert_eq!(combos[1].force, 2.0);
+        assert_eq!(cases[0].m, 1);
+        assert_eq!(cases[0].f, 1.0);
+        assert_eq!(cases[1].f, 2.0);
+        // l は m と σ から導出される。
+        assert!((cases[0].l - 2.0 * 0.8 * 8.0e-3).abs() < 1.0e-15);
     }
 
     #[test]
-    fn parameter_combinations_dedup_repeated_values() {
-        let combos = parameter_combinations(&[1, 1, 4], &[0.5, 0.5], &[1.0], &[2.0]).unwrap();
-        assert_eq!(combos.len(), 2);
+    fn cases_dedup_repeated_values() {
+        let text = minimal_config_text().replace("m = [1, 4]", "m = [1, 1, 4]");
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.cases().unwrap().len(), 2 * 2 * 3);
     }
 
     #[test]
-    fn parameter_combinations_reject_non_positive_m() {
-        let error = parameter_combinations(&[0], &[0.5], &[1.0], &[2.0]).unwrap_err();
-        assert!(error.to_string().contains("m must be at least 1"));
+    fn cases_reject_colliding_dir_names() {
+        // 6桁丸めでは区別できない 2 値は、出力フォルダが衝突するため展開時に弾く。
+        let text = minimal_config_text().replace("f = [1.0, 2.0, 3.0]", "f = [1e-9, 2e-9]");
+        let config: Config = toml::from_str(&text).unwrap();
+        let error = config.cases().unwrap_err();
+        assert!(error.to_string().contains("重複"));
     }
 
     #[test]
-    fn parse_ratio_accepts_fractions_and_decimals() {
-        assert!((parse_ratio("1/3").unwrap() - 1.0 / 3.0).abs() < 1.0e-15);
-        assert_eq!(parse_ratio("0.5").unwrap(), 0.5);
-        assert_eq!(parse_ratio(" 3 / 4 ").unwrap(), 0.75);
-        assert!(parse_ratio("1/0").is_err());
-        assert!(parse_ratio("abc").is_err());
+    fn validate_rejects_non_positive_m() {
+        let text = minimal_config_text().replace("m = [1, 4]", "m = [0]");
+        let config: Config = toml::from_str(&text).unwrap();
+        let error = config.validate().unwrap_err();
+        assert!(error.to_string().contains("m は1以上"));
     }
 
     #[test]
-    fn combo_dir_name_trims_trailing_zeros() {
-        let params = SimParams {
-            combo_id: 0,
+    fn parse_fraction_accepts_fractions_and_decimals() {
+        assert!((parse_fraction("1/3").unwrap() - 1.0 / 3.0).abs() < 1.0e-15);
+        assert_eq!(parse_fraction("0.5").unwrap(), 0.5);
+        assert_eq!(parse_fraction(" 3 / 4 ").unwrap(), 0.75);
+        assert!(parse_fraction("1/0").is_err());
+        assert!(parse_fraction("abc").is_err());
+    }
+
+    #[test]
+    fn case_dir_name_trims_trailing_zeros() {
+        let case = Case {
+            case_id: 0,
             m: 3,
-            l: particle_length(3),
-            beta_pe: 1.0,
-            abs_delta_alpha_e_over_p: 0.5,
-            force: 0.0,
+            l: 0.0,
+            gamma: 1.0,
+            delta: 1.0 / 3.0,
+            f: 0.0,
         };
-        assert_eq!(combo_dir_name(&params), "m3_f0_beta1_delta0.5");
+        assert_eq!(case.dir_name(), "m3_f0_gamma1_delta0.333333");
     }
 
     #[test]
-    fn m_values_map_to_expected_point_counts_and_lengths() {
-        let expected_points = [(1, 3), (4, 9), (8, 17), (15, 31), (30, 61)];
-        for (m, points) in expected_points {
-            assert_eq!(2 * m + 1, points);
-            assert_eq!(particle_length(m), 2.0 * f64::from(m) * 0.8 * SIGMA);
-        }
-    }
+    fn case_seed_is_deterministic_and_distinct() {
+        let base = Case {
+            case_id: 0,
+            m: 3,
+            l: 0.0384,
+            gamma: 1.0,
+            delta: 0.5,
+            f: 2.0,
+        };
+        let same = Case { case_id: 9, ..base };
+        let different = Case { f: 3.0, ..base };
 
-    /// D_0 の基準棒長が、全棒長で共有する 6 点間隔ぶんの長さになっていることを確認する。
-    #[test]
-    fn diffusion_reference_length_matches_channel_neck_scale() {
-        assert_eq!(DIFFUSION_REFERENCE_LENGTH, 6.0 * 0.8 * SIGMA);
-        assert!((DIFFUSION_REFERENCE_LENGTH - 0.0384).abs() < 1.0e-15);
-    }
-
-    /// 境界補正と反発力上限に使う数値安全用の共通定数を確認する。
-    #[test]
-    fn numerical_safety_constants_match_shared_model() {
-        assert_eq!(MAX_WALL_REPULSION_FORCE, 2.5e4);
-        assert_eq!(BOUNDARY_REFLECTION_LIMIT, 32);
-        assert!((CHANNEL_NECK_PHASE - 0.809_640_837_312_333_2).abs() < 1.0e-15);
+        // case_id には依存せず、物理パラメータだけで決まる。
+        assert_eq!(base.seed(), same.seed());
+        assert_ne!(base.seed(), different.seed());
     }
 }

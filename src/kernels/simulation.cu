@@ -9,18 +9,21 @@ static_assert(
 // Rust側の #[repr(C)] KernelParams と同じ順序・型にする。
 struct KernelParams
 {
-  int combo_id;
   int m;
   int n_wall;
   int wall_k;
   int boundary_reflection_limit;
   double l;
-  double beta_pe;
-  double abs_delta_alpha_e_over_p;
+  double gamma;
+  double delta;
   double force;
   double d_parallel;
   double d_perp;
   double d_r;
+  // 並進・回転ノイズの係数 sqrt(2 D Δt)。ケース内で不変なのでホスト側で事前計算する。
+  double trans_noise_parallel;
+  double trans_noise_perp;
+  double rot_noise;
   double dt;
   double sigma;
   double epsilon;
@@ -263,12 +266,13 @@ __device__ void add_wca_force(
     double pair_force_x = coeff * dx;
     double pair_force_y = coeff * dy;
     double pair_force2 = pair_force_x * pair_force_x + pair_force_y * pair_force_y;
-    double pair_force = sqrt(pair_force2);
+    double max_force = params.max_wall_repulsion_force;
 
     // 近接時の特異的な壁反発だけを上限値に収め、反発方向は保つ。
-    if (pair_force > params.max_wall_repulsion_force)
+    // 2乗のまま比較して、上限を超えたときだけ平方根を計算する。
+    if (pair_force2 > max_force * max_force)
     {
-      double scale = params.max_wall_repulsion_force / pair_force;
+      double scale = max_force / sqrt(pair_force2);
       pair_force_x *= scale;
       pair_force_y *= scale;
     }
@@ -320,9 +324,10 @@ __device__ GeneralizedForce generalized_force_at(
     torque_sum += offset * (c * force_y - s * force_x);
   }
 
-  // 補足資料 式(8) の形 τ_E = βpE·cosφ·(1 − (|Δα|E/p)·sinφ)。
-  // βpE は p = ql を含む電場結合の大きさそのもの（l は掛けない）。|Δα|E/p は正で横倒し効果を生む。
-  double tau_e = params.beta_pe * c * (1.0 - params.abs_delta_alpha_e_over_p * s);
+  // 補足資料 式(8) の形 τ_E = γ·cosφ·(1 − δ·sinφ)。
+  // γ = βpE は電場結合の大きさそのもの（l は掛けない）。
+  // δ = |Δα|E/p は正で棒を横へ倒す効果を生む。
+  double tau_e = params.gamma * c * (1.0 - params.delta * s);
 
   GeneralizedForce result;
   result.force_x = params.force + rep_sum_x;
@@ -344,8 +349,8 @@ __device__ LabTransport lab_transport_at(
   sincos(2.0 * phii, &sin2, &cos2);
   double d_scale = 0.25 * params.d_parallel;
 
-  double noise_body_x = sqrt(2.0 * params.d_parallel * params.dt) * normal_t.x;
-  double noise_body_y = sqrt(2.0 * params.d_perp * params.dt) * normal_t.y;
+  double noise_body_x = params.trans_noise_parallel * normal_t.x;
+  double noise_body_y = params.trans_noise_perp * normal_t.y;
 
   LabTransport result;
   result.dxx = d_scale * (3.0 + cos2);
@@ -357,11 +362,11 @@ __device__ LabTransport lab_transport_at(
 }
 
 // 各trialに独立したPhilox系cuRAND stateを初期化する。
+// seedはケースのパラメータから決定論的に導出された値で、trial番号を系列番号に使う。
 extern "C" __global__ void setup_rng_kernel(
     unsigned char *rng_states,
     int rng_stride,
     unsigned long long seed,
-    unsigned long long sequence_offset,
     int n_trials)
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -376,7 +381,7 @@ extern "C" __global__ void setup_rng_kernel(
   }
 
   curandStatePhilox4_32_10_t *state = rng_state_at(rng_states, rng_stride, i);
-  curand_init(seed, sequence_offset + static_cast<unsigned long long>(i), 0, state);
+  curand_init(seed, static_cast<unsigned long long>(i), 0, state);
 }
 
 // 初期位置・角度を乱数で決め、状態配列を初期化する。
@@ -520,7 +525,7 @@ extern "C" __global__ void simulate_kernel(
     // 並進に2個、回転に1個の標準正規乱数を使う。
     double2 normal_t = curand_normal2_double(state);
     double normal_r = curand_normal_double(state);
-    double noise_phi = sqrt(2.0 * params.d_r * params.dt) * normal_r;
+    double noise_phi = params.rot_noise * normal_r;
 
     LabTransport predictor_transport = lab_transport_at(phii, normal_t, params);
     GeneralizedForce predictor_force = generalized_force_at(xi, yi, phii, wall_y, params);

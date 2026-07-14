@@ -1,3 +1,8 @@
+//! 物理モデルの GPU（CUDA）バックエンド。
+//!
+//! CUDA C ソース（kernels/simulation.cu）を実行時に NVRTC でコンパイルし、
+//! 1 GPU 上で複数ケースを CUDA stream により同時並行に処理する。
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,17 +13,19 @@ use cudarc::driver::{
 use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 
 use crate::config::{
-    BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, DT, EPSILON, HIST_PHI_BINS, HIST_X_BINS,
-    HIST_Y_BINS, HIST_Y_MAX, MAX_WALL_REPULSION_FORCE, RNG_STATE_BYTES, SIGMA, SimParams, WALL_DX,
-    WALL_K,
+    BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, Case, HIST_PHI_BINS, HIST_X_BINS, HIST_Y_BINS,
+    HIST_Y_MAX, MAX_WALL_REPULSION_FORCE, Physics, WALL_K,
 };
 use crate::model::{
-    STATUS_RUNNING, SummaryRow, TrialResult, diffusion_for_length, summarize_trials,
-    wall_y_samples,
+    CaseOutput, STATUS_RUNNING, TrialResult, diffusion_for_length, summarize_trials, wall_y_samples,
 };
 
 const KERNEL_SRC: &str = include_str!("kernels/simulation.cu");
+/// CUDA kernel のブロックあたりスレッド数。
+/// A100 での実測では 128 との差が ±3% 以内で一貫した優位がないため、256 のままにする。
 const CUDA_THREADS_PER_BLOCK: u32 = 256;
+/// cuRAND Philox state 1個分として確保するバイト数（実サイズは kernel 側で検査する）。
+const RNG_STATE_BYTES: usize = 256;
 
 /// CUDA kernel に値渡しするパラメータ。
 ///
@@ -26,18 +33,21 @@ const CUDA_THREADS_PER_BLOCK: u32 = 256;
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 struct KernelParams {
-    combo_id: i32,
     m: i32,
     n_wall: i32,
     wall_k: i32,
     boundary_reflection_limit: i32,
     l: f64,
-    beta_pe: f64,
-    abs_delta_alpha_e_over_p: f64,
+    gamma: f64,
+    delta: f64,
     force: f64,
     d_parallel: f64,
     d_perp: f64,
     d_r: f64,
+    /// 並進・回転ノイズの係数 sqrt(2 D Δt)。ケース内で不変なのでホスト側で事前計算する。
+    trans_noise_parallel: f64,
+    trans_noise_perp: f64,
+    rot_noise: f64,
     dt: f64,
     sigma: f64,
     epsilon: f64,
@@ -55,30 +65,31 @@ struct KernelParams {
 unsafe impl DeviceRepr for KernelParams {}
 
 impl KernelParams {
-    /// Rust 側の物理パラメータから、CUDA kernel で直接使う値へ展開する。
-    fn from_params(params: SimParams) -> Self {
-        let diffusion = diffusion_for_length(params.l);
-        let rc = 2.0_f64.powf(1.0 / 6.0) * SIGMA;
+    /// 共通の物理定数とケース固有のパラメータから、CUDA kernel で直接使う値へ展開する。
+    fn new(physics: &Physics, case: Case) -> Self {
+        let diffusion = diffusion_for_length(case.l, physics.diffusion_reference_length);
 
         Self {
-            combo_id: params.combo_id as i32,
-            m: params.m,
-            n_wall: crate::config::N_WALL as i32,
+            m: case.m,
+            n_wall: physics.n_wall as i32,
             wall_k: WALL_K,
             boundary_reflection_limit: BOUNDARY_REFLECTION_LIMIT as i32,
-            l: params.l,
-            beta_pe: params.beta_pe,
-            abs_delta_alpha_e_over_p: params.abs_delta_alpha_e_over_p,
-            force: params.force,
+            l: case.l,
+            gamma: case.gamma,
+            delta: case.delta,
+            force: case.f,
             d_parallel: diffusion.d_parallel,
             d_perp: diffusion.d_perp,
             d_r: diffusion.d_r,
-            dt: DT,
-            sigma: SIGMA,
-            epsilon: EPSILON,
-            wall_dx: WALL_DX,
-            particle_dx: crate::config::PARTICLE_DX,
-            rc2: rc * rc,
+            trans_noise_parallel: (2.0 * diffusion.d_parallel * physics.delta_t).sqrt(),
+            trans_noise_perp: (2.0 * diffusion.d_perp * physics.delta_t).sqrt(),
+            rot_noise: (2.0 * diffusion.d_r * physics.delta_t).sqrt(),
+            dt: physics.delta_t,
+            sigma: physics.sigma,
+            epsilon: physics.epsilon,
+            wall_dx: physics.wall_dx,
+            particle_dx: physics.particle_dx,
+            rc2: physics.rc2(),
             max_wall_repulsion_force: MAX_WALL_REPULSION_FORCE,
             channel_neck_phase: CHANNEL_NECK_PHASE,
             hist_x_bins: HIST_X_BINS as i32,
@@ -93,45 +104,36 @@ impl KernelParams {
 #[derive(Clone, Debug)]
 pub struct GpuRunConfig {
     pub device_id: usize,
-    pub seed: u64,
     pub max_steps: u64,
     pub steps_per_launch: u32,
     /// 何ステップごとに角度・y分布ヒストグラムへ加算するか。0 で記録を無効にする。
     pub hist_stride: u32,
-    /// production で1 GPU が同時並行に走らせる combo 数（CUDA stream 数）。
-    pub num_streams: usize,
-    pub cuda_include_paths: Vec<String>,
-    pub cuda_arch: String,
+    /// 1 GPU が同時並行に走らせるケース数（= CUDA stream 数）。
+    pub tasks_per_gpu: usize,
     pub progress_interval: Duration,
-}
-
-/// 1 combo の集計結果。
-///
-/// trial 詳細は完了ごとに別経路（`on_trials`）で流すため、ここには含めない。
-/// `hist_phi` は (x × φ)、`hist_y` は (x × y) の2Dヒストグラムを、x を最外として
-/// 行優先で平坦化したもの。
-#[derive(Debug)]
-pub struct ComboOutput {
-    pub summary: SummaryRow,
-    pub hist_phi: Vec<u64>,
-    pub hist_y: Vec<u64>,
 }
 
 /// kernel chunk ごとに host 側へ返す進捗。
 #[derive(Clone, Debug)]
 pub struct GpuProgress {
-    pub combo_id: u32,
+    pub case_id: u32,
     pub completed_trials: usize,
     pub total_trials: usize,
     pub current_steps: u64,
     pub status: String,
 }
 
+/// 搭載されている GPU の台数を返す。
+pub fn device_count() -> Result<usize> {
+    let count = CudaContext::device_count().context("GPU の台数を取得できません")?;
+    Ok(count as usize)
+}
+
 /// NVRTC が `curand_kernel.h` を見つけるための CUDA include path 候補を作る。
 ///
 /// `/usr/include` は glibc ヘッダを NVRTC が追いかけて失敗しやすいため入れない。
-pub fn cuda_include_paths(user_paths: &[String]) -> Vec<String> {
-    let mut paths = user_paths.to_vec();
+fn cuda_include_paths() -> Vec<String> {
+    let mut paths = Vec::new();
 
     if let Ok(cuda_home) = std::env::var("CUDA_HOME") {
         paths.push(format!("{cuda_home}/include"));
@@ -148,18 +150,30 @@ pub fn cuda_include_paths(user_paths: &[String]) -> Vec<String> {
     paths
 }
 
-/// 1つの CUDA stream が処理中の combo の進行状況。
+/// 全 slot（stream）で共有する、コンパイル済み kernel と共通の起動引数一式。
+struct KernelLaunch {
+    setup_rng: CudaFunction,
+    init_trials: CudaFunction,
+    simulate: CudaFunction,
+    /// 全ケース共通・読み取り専用の上壁 y 座標サンプル。
+    wall_y_dev: CudaSlice<f64>,
+    cfg: LaunchConfig,
+    rng_stride: i32,
+    n_trials: i32,
+}
+
+/// 1つの CUDA stream が処理中のケースの進行状況。
 struct SlotJob {
-    params: SimParams,
+    case: Case,
     kparams: KernelParams,
     launched_steps: u64,
     last_progress: Instant,
 }
 
-/// 1 stream 分の再利用バッファと、現在割り当てられている combo。
+/// 1 stream 分の再利用バッファと、現在割り当てられているケース。
 ///
-/// production では combo をまたいで同じ device バッファを使い回し、`start_job` で
-/// 乱数・初期状態だけ作り直す。`job` が `None` の slot は空き。
+/// ケースをまたいで同じ device バッファを使い回し、`start_job` で乱数・初期状態だけ
+/// 作り直す。`job` が `None` の slot は空き。
 struct StreamSlot {
     stream: Arc<CudaStream>,
     rng_states: CudaSlice<u8>,
@@ -179,7 +193,7 @@ struct StreamSlot {
     hist_phi: CudaSlice<u64>,
     hist_y: CudaSlice<u64>,
     job: Option<SlotJob>,
-    /// trial index ごとに、確定結果を既に host へ流したか。combo ごとに `start_job` で戻す。
+    /// trial index ごとに、確定結果を既に host へ流したか。ケースごとに `start_job` で戻す。
     emitted: Vec<bool>,
     /// `emitted` のうち true の数。新たに完了した trial の有無を counters と比べて判定する。
     emitted_count: usize,
@@ -203,7 +217,7 @@ impl StreamSlot {
         let statuses = stream.alloc_zeros::<i32>(trial_count)?;
         let pass_directions = stream.alloc_zeros::<i32>(trial_count)?;
         let counters = stream.alloc_zeros::<u64>(2)?;
-        // combo 全体（全trial・全ステップ）で共有して票を貯める2Dヒストグラム。
+        // ケース全体（全trial・全ステップ）で共有して票を貯める2Dヒストグラム。
         let hist_phi = stream.alloc_zeros::<u64>(HIST_X_BINS * HIST_PHI_BINS)?;
         let hist_y = stream.alloc_zeros::<u64>(HIST_X_BINS * HIST_Y_BINS)?;
         Ok(Self {
@@ -230,48 +244,38 @@ impl StreamSlot {
         })
     }
 
-    /// この slot へ新しい combo を割り当て、cuRAND state と初期状態を作り直す。
+    /// この slot へ新しいケースを割り当て、cuRAND state と初期状態を作り直す。
     ///
-    /// combo ごとに `combo_id` から決まる `sequence_offset` を使うので、同じ seed なら
-    /// 割り当て順に依らずビット単位で同じ結果になる。
-    fn start_job(
-        &mut self,
-        params: SimParams,
-        seed: u64,
-        rng_stride: i32,
-        n_trials: i32,
-        cfg: LaunchConfig,
-        setup_rng: &CudaFunction,
-        init_trials: &CudaFunction,
-    ) -> Result<()> {
-        let kparams = KernelParams::from_params(params);
-        let sequence_offset = u64::from(params.combo_id) * 1_000_000_000;
+    /// 乱数シードはケースのパラメータから決定論的に導出されるため、GPU への
+    /// 割り当て順に依らず、同じ設定からは常に同じ結果になる。
+    fn start_job(&mut self, case: Case, physics: &Physics, launch: &KernelLaunch) -> Result<()> {
+        let kparams = KernelParams::new(physics, case);
+        let seed = case.seed();
         let stream = self.stream.clone();
 
-        // 前の combo の完了カウンタとヒストグラムを0に戻してから再初期化する。
+        // 前のケースの完了カウンタとヒストグラムを0に戻してから再初期化する。
         stream.memset_zeros(&mut self.counters)?;
         stream.memset_zeros(&mut self.hist_phi)?;
         stream.memset_zeros(&mut self.hist_y)?;
 
-        // 前の combo の「出力済み」印も戻し、新しい combo を最初から数え直す。
+        // 前のケースの「出力済み」印も戻し、新しいケースを最初から数え直す。
         self.emitted.fill(false);
         self.emitted_count = 0;
 
         {
-            let mut setup = stream.launch_builder(setup_rng);
+            let mut setup = stream.launch_builder(&launch.setup_rng);
             setup.arg(&mut self.rng_states);
-            setup.arg(&rng_stride);
+            setup.arg(&launch.rng_stride);
             setup.arg(&seed);
-            setup.arg(&sequence_offset);
-            setup.arg(&n_trials);
-            unsafe { setup.launch(cfg) }?;
+            setup.arg(&launch.n_trials);
+            unsafe { setup.launch(launch.cfg) }?;
         }
 
         {
-            let mut init = stream.launch_builder(init_trials);
+            let mut init = stream.launch_builder(&launch.init_trials);
             init.arg(&kparams);
             init.arg(&mut self.rng_states);
-            init.arg(&rng_stride);
+            init.arg(&launch.rng_stride);
             init.arg(&mut self.x0);
             init.arg(&mut self.y0);
             init.arg(&mut self.phi0);
@@ -284,12 +288,12 @@ impl StreamSlot {
             init.arg(&mut self.steps);
             init.arg(&mut self.statuses);
             init.arg(&mut self.pass_directions);
-            init.arg(&n_trials);
-            unsafe { init.launch(cfg) }?;
+            init.arg(&launch.n_trials);
+            unsafe { init.launch(launch.cfg) }?;
         }
 
         self.job = Some(SlotJob {
-            params,
+            case,
             kparams,
             launched_steps: 0,
             last_progress: Instant::now(),
@@ -297,26 +301,16 @@ impl StreamSlot {
         Ok(())
     }
 
-    /// 現在の combo を `steps_per_launch` だけ非同期に進める。
-    fn launch_sim(
-        &mut self,
-        simulate: &CudaFunction,
-        wall_y_dev: &CudaSlice<f64>,
-        cfg: LaunchConfig,
-        rng_stride: i32,
-        n_trials: i32,
-        steps_per_launch: u32,
-        hist_stride: u32,
-        max_steps: u64,
-    ) -> Result<()> {
+    /// 現在のケースを `steps_per_launch` だけ非同期に進める。
+    fn launch_sim(&mut self, launch: &KernelLaunch, config: &GpuRunConfig) -> Result<()> {
         let kparams = self.job.as_ref().expect("launch_sim on idle slot").kparams;
         let stream = self.stream.clone();
         {
-            let mut step = stream.launch_builder(simulate);
+            let mut step = stream.launch_builder(&launch.simulate);
             step.arg(&kparams);
             step.arg(&mut self.rng_states);
-            step.arg(&rng_stride);
-            step.arg(wall_y_dev);
+            step.arg(&launch.rng_stride);
+            step.arg(&launch.wall_y_dev);
             step.arg(&mut self.x);
             step.arg(&mut self.y);
             step.arg(&mut self.phi);
@@ -329,14 +323,16 @@ impl StreamSlot {
             step.arg(&mut self.counters);
             step.arg(&mut self.hist_phi);
             step.arg(&mut self.hist_y);
-            step.arg(&n_trials);
-            step.arg(&steps_per_launch);
-            step.arg(&hist_stride);
-            step.arg(&max_steps);
-            unsafe { step.launch(cfg) }?;
+            step.arg(&launch.n_trials);
+            step.arg(&config.steps_per_launch);
+            step.arg(&config.hist_stride);
+            step.arg(&config.max_steps);
+            unsafe { step.launch(launch.cfg) }?;
         }
         let job = self.job.as_mut().expect("launch_sim on idle slot");
-        job.launched_steps = job.launched_steps.saturating_add(u64::from(steps_per_launch));
+        job.launched_steps = job
+            .launched_steps
+            .saturating_add(u64::from(config.steps_per_launch));
         Ok(())
     }
 
@@ -349,7 +345,7 @@ impl StreamSlot {
     fn collect_unemitted(
         &mut self,
         device_id: usize,
-        params: SimParams,
+        case: Case,
         emit_all: bool,
         host_times: &[f64],
         host_statuses: &[i32],
@@ -372,10 +368,10 @@ impl StreamSlot {
             self.emitted[idx] = true;
             self.emitted_count += 1;
             rows.push(TrialResult {
-                combo_id: params.combo_id,
+                case_id: case.case_id,
                 trial_id: idx as u64,
-                device_id,
-                params,
+                gpu_id: Some(device_id),
+                case,
                 x0: host_x0[idx],
                 y0: host_y0[idx],
                 phi0: host_phi0[idx],
@@ -392,75 +388,68 @@ impl StreamSlot {
     }
 }
 
-/// 1 GPU 上で複数 combo を CUDA stream で同時並行に処理し、queue を空にする。
+/// 1 GPU 上で複数ケースを CUDA stream で同時並行に処理し、queue を空にする。
 ///
-/// N=1000 の1 combo は A100 の数 SM しか埋めないため、`num_streams` 本の stream に
-/// 別々の combo を載せて占有率を上げる。各 trial の計算は1スレッド=1 trial のまま変えない。
-/// combo が完了した stream はすぐ次の combo を queue から取り直すので、遅い combo が
+/// 1ケースだけでは A100 の一部の SM しか埋まらないため、`tasks_per_gpu` 本の stream に
+/// 別々のケースを載せて占有率を上げる。各 trial の計算は1スレッド=1 trial のまま変えない。
+/// ケースが完了した stream はすぐ次のケースを queue から取り直すので、遅いケースが
 /// GPU 全体を遊ばせ続けることもない。
 ///
-/// 完了した trial は chunk ごとに `on_trials` で逐次流し、combo 全体の集計（summary・
+/// 完了した trial は chunk ごとに `on_trials` で逐次流し、ケース全体の集計（summary・
 /// ヒストグラム）は完了時に `on_finished` で1度だけ流す。
 ///
-/// `next_params` が `None` を返したら新規割り当てを止め、実行中の combo を全て見送って終了する。
+/// `next_case` が `None` を返したら新規割り当てを止め、実行中のケースを全て見送って終了する。
 pub fn run_device_streamed<FNext, FProgress, FTrials, FFinished>(
     config: &GpuRunConfig,
+    physics: &Physics,
     trial_count: usize,
-    mut next_params: FNext,
+    mut next_case: FNext,
     mut on_progress: FProgress,
     mut on_trials: FTrials,
     mut on_finished: FFinished,
 ) -> Result<()>
 where
-    FNext: FnMut() -> Option<SimParams>,
+    FNext: FnMut() -> Option<Case>,
     FProgress: FnMut(GpuProgress),
     FTrials: FnMut(Vec<TrialResult>),
-    FFinished: FnMut(ComboOutput),
+    FFinished: FnMut(CaseOutput),
 {
     anyhow::ensure!(trial_count > 0, "trial_count must be positive");
 
-    let ptx = compile_kernel(config).context("failed to compile CUDA kernel with NVRTC")?;
-    let ctx = CudaContext::new(config.device_id).with_context(|| {
-        format!(
-            "failed to create CUDA context for device {}",
-            config.device_id
-        )
-    })?;
-    let module = ctx.load_module(ptx).context("failed to load CUDA module")?;
-    let setup_rng = module.load_function("setup_rng_kernel")?;
-    let init_trials = module.load_function("init_trials_kernel")?;
-    let simulate = module.load_function("simulate_kernel")?;
-
-    let rng_stride = i32::try_from(RNG_STATE_BYTES).expect("RNG_STATE_BYTES fits in i32");
-    let n_trials_i32 = i32::try_from(trial_count).context("too many trials for i32")?;
-    let cfg = launch_config_for_trials(trial_count);
-
-    // wall_y は全 combo 共通・読み取り専用。1度だけ確保し、同期してから全 stream で共有する。
+    let ctx = CudaContext::new(config.device_id)
+        .with_context(|| format!("GPU {} の CUDA context を作成できません", config.device_id))?;
+    let ptx = compile_kernel(&ctx).context("CUDA kernel の NVRTC コンパイルに失敗しました")?;
+    let module = ctx
+        .load_module(ptx)
+        .context("CUDA module を読み込めません")?;
+    // wall_y は全ケース共通・読み取り専用。1度だけ確保し、同期してから全 stream で共有する。
     let setup_stream = ctx.default_stream();
-    let wall_y = wall_y_samples();
+    let wall_y = wall_y_samples(physics);
     let wall_y_dev = setup_stream.clone_htod(&wall_y)?;
     setup_stream.synchronize()?;
 
-    let num_streams = config.num_streams.max(1);
-    let mut slots: Vec<StreamSlot> = Vec::with_capacity(num_streams);
-    for _ in 0..num_streams {
+    let launch = KernelLaunch {
+        setup_rng: module.load_function("setup_rng_kernel")?,
+        init_trials: module.load_function("init_trials_kernel")?,
+        simulate: module.load_function("simulate_kernel")?,
+        wall_y_dev,
+        cfg: launch_config_for_trials(trial_count),
+        rng_stride: i32::try_from(RNG_STATE_BYTES).expect("RNG_STATE_BYTES fits in i32"),
+        n_trials: i32::try_from(trial_count).context("too many trials for i32")?,
+    };
+
+    let tasks_per_gpu = config.tasks_per_gpu.max(1);
+    let mut slots: Vec<StreamSlot> = Vec::with_capacity(tasks_per_gpu);
+    for _ in 0..tasks_per_gpu {
         slots.push(StreamSlot::new(&ctx, trial_count)?);
     }
 
-    // 最初の combo を各 stream へ割り当てる。combo 数が stream 数より少なくてもよい。
+    // 最初のケースを各 stream へ割り当てる。ケース数が stream 数より少なくてもよい。
     for slot in &mut slots {
-        let Some(params) = next_params() else {
+        let Some(case) = next_case() else {
             break;
         };
-        slot.start_job(
-            params,
-            config.seed,
-            rng_stride,
-            n_trials_i32,
-            cfg,
-            &setup_rng,
-            &init_trials,
-        )?;
+        slot.start_job(case, physics, &launch)?;
     }
 
     loop {
@@ -468,16 +457,7 @@ where
         let mut any_active = false;
         for slot in &mut slots {
             if slot.job.is_some() {
-                slot.launch_sim(
-                    &simulate,
-                    &wall_y_dev,
-                    cfg,
-                    rng_stride,
-                    n_trials_i32,
-                    config.steps_per_launch,
-                    config.hist_stride,
-                    config.max_steps,
-                )?;
+                slot.launch_sim(&launch, config)?;
                 any_active = true;
             }
         }
@@ -485,7 +465,7 @@ where
             break;
         }
 
-        // Phase B: 各 stream を待って完了判定し、終わった combo を集計して次を補充する。
+        // Phase B: 各 stream を待って完了判定し、終わったケースを集計して次を補充する。
         for slot in &mut slots {
             if slot.job.is_none() {
                 continue;
@@ -497,11 +477,16 @@ where
             let launched = slot.job.as_ref().expect("active slot").launched_steps;
             let done = completed == trial_count || launched >= config.max_steps;
 
-            let elapsed = slot.job.as_ref().expect("active slot").last_progress.elapsed();
+            let elapsed = slot
+                .job
+                .as_ref()
+                .expect("active slot")
+                .last_progress
+                .elapsed();
             if done || elapsed >= config.progress_interval {
-                let combo_id = slot.job.as_ref().expect("active slot").params.combo_id;
+                let case_id = slot.job.as_ref().expect("active slot").case.case_id;
                 on_progress(GpuProgress {
-                    combo_id,
+                    case_id,
                     completed_trials: completed,
                     total_trials: trial_count,
                     current_steps: launched.min(config.max_steps),
@@ -516,10 +501,10 @@ where
                 let host_times = slot.stream.clone_dtoh(&slot.times)?;
                 let host_statuses = slot.stream.clone_dtoh(&slot.statuses)?;
                 let host_pass_directions = slot.stream.clone_dtoh(&slot.pass_directions)?;
-                let params = slot.job.as_ref().expect("active slot").params;
+                let case = slot.job.as_ref().expect("active slot").case;
                 let rows = slot.collect_unemitted(
                     config.device_id,
-                    params,
+                    case,
                     false,
                     &host_times,
                     &host_statuses,
@@ -534,13 +519,13 @@ where
                 let host_times = slot.stream.clone_dtoh(&slot.times)?;
                 let host_statuses = slot.stream.clone_dtoh(&slot.statuses)?;
                 let host_pass_directions = slot.stream.clone_dtoh(&slot.pass_directions)?;
-                let params = slot.job.as_ref().expect("active slot").params;
+                let case = slot.job.as_ref().expect("active slot").case;
 
                 // max_steps で未通過のまま終わった trial など、まだ出していない行を出し切る。
                 // summary より先に流して、集計確定までに全 trial 行が書き終わるようにする。
                 let rows = slot.collect_unemitted(
                     config.device_id,
-                    params,
+                    case,
                     true,
                     &host_times,
                     &host_statuses,
@@ -551,34 +536,26 @@ where
                 }
 
                 let summary = summarize_trials(
-                    config.device_id,
-                    params,
+                    Some(config.device_id),
+                    case,
                     trial_count,
-                    config.seed,
+                    physics,
                     &host_times,
                     &host_statuses,
                     &host_pass_directions,
                 );
                 let hist_phi = slot.stream.clone_dtoh(&slot.hist_phi)?;
                 let hist_y = slot.stream.clone_dtoh(&slot.hist_y)?;
-                on_finished(ComboOutput {
+                on_finished(CaseOutput {
                     summary,
                     hist_phi,
                     hist_y,
                 });
 
-                // 同じバッファを使い回して次の combo を載せる。queue が空なら idle に戻す。
-                match next_params() {
-                    Some(params) => {
-                        slot.start_job(
-                            params,
-                            config.seed,
-                            rng_stride,
-                            n_trials_i32,
-                            cfg,
-                            &setup_rng,
-                            &init_trials,
-                        )?;
+                // 同じバッファを使い回して次のケースを載せる。queue が空なら idle に戻す。
+                match next_case() {
+                    Some(case) => {
+                        slot.start_job(case, physics, &launch)?;
                     }
                     None => slot.job = None,
                 }
@@ -590,14 +567,19 @@ where
 }
 
 /// CUDA C ソースを実行時に PTX へコンパイルする。
-fn compile_kernel(config: &GpuRunConfig) -> Result<cudarc::nvrtc::Ptx> {
+///
+/// `--gpu-architecture` は実行する GPU の compute capability から自動的に決める。
+fn compile_kernel(ctx: &CudaContext) -> Result<cudarc::nvrtc::Ptx> {
+    let (major, minor) = ctx
+        .compute_capability()
+        .context("GPU の compute capability を取得できません")?;
     let options = vec![
-        format!("--gpu-architecture={}", config.cuda_arch),
+        format!("--gpu-architecture=compute_{major}{minor}"),
         "--std=c++14".to_string(),
     ];
 
     let compile_options = CompileOptions {
-        include_paths: config.cuda_include_paths.clone(),
+        include_paths: cuda_include_paths(),
         options,
         name: Some("simulation.cu".to_string()),
         ..Default::default()

@@ -1,9 +1,11 @@
+//! GPU/CPU 両バックエンドとアニメーションで共有する物理モデルの数式と集計。
+//!
+//! 流路形状 omega(x)・境界の鏡像反射・Tirado の拡散係数・試行結果の集計など、
+//! 実装バックエンドに依存しない純粋な計算をまとめる。
+
 use serde::Serialize;
 
-use crate::config::{
-    BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, DIFFUSION_REFERENCE_LENGTH, EPSILON, L_PERIOD,
-    N_WALL, SIGMA, SimParams, WALL_DX, WALL_K, particle_length,
-};
+use crate::config::{BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, Case, L_PERIOD, Physics};
 
 // CUDA kernel と共有する trial の状態コード。
 pub const STATUS_RUNNING: i32 = 0;
@@ -34,15 +36,16 @@ struct TiradoTerms {
     denominator: f64,
 }
 
-/// GPU から回収した1試行分の詳細結果。
+/// バックエンドから回収した1試行分の詳細結果。
 ///
-/// smoke run の `smoke_trials.csv` にだけ展開される。
+/// 各ケースの `trials.csv` に1行として書き出される。
 #[derive(Clone, Debug)]
 pub struct TrialResult {
-    pub combo_id: u32,
+    pub case_id: u32,
     pub trial_id: u64,
-    pub device_id: usize,
-    pub params: SimParams,
+    /// 計算した GPU の ID。CPU バックエンドでは None。
+    pub gpu_id: Option<usize>,
+    pub case: Case,
     pub x0: f64,
     pub y0: f64,
     pub phi0: f64,
@@ -55,16 +58,16 @@ pub struct TrialResult {
     pub pass_direction: i32,
 }
 
-/// smoke run で出力する trial 詳細 CSV の1行。
+/// trials.csv の1行。
 #[derive(Debug, Serialize)]
 pub struct TrialCsvRow {
-    pub combo_id: u32,
+    pub case_id: u32,
     pub trial_id: u64,
-    pub device_id: usize,
+    pub gpu_id: Option<usize>,
     pub m: i32,
     pub l: f64,
-    pub beta_pe: f64,
-    pub abs_delta_alpha_e_over_p: f64,
+    pub gamma: f64,
+    pub delta: f64,
     pub f: f64,
     pub x0: f64,
     pub y0: f64,
@@ -79,17 +82,16 @@ pub struct TrialCsvRow {
     pub pass_direction: &'static str,
 }
 
-/// パラメータ組み合わせごとの集計 JSON の1要素。
-///
-/// production run ではこの行だけを出力し、trial 詳細は保存しない。
+/// 1ケース分の集計結果（summary.json の中身）。
 #[derive(Clone, Debug, Serialize)]
 pub struct SummaryRow {
-    pub combo_id: u32,
-    pub device_id: usize,
+    pub case_id: u32,
+    /// 計算した GPU の ID。CPU バックエンドでは null。
+    pub gpu_id: Option<usize>,
     pub m: i32,
     pub l: f64,
-    pub beta_pe: f64,
-    pub abs_delta_alpha_e_over_p: f64,
+    pub gamma: f64,
+    pub delta: f64,
     pub f: f64,
     pub n_total: usize,
     pub n_ok: usize,
@@ -111,14 +113,27 @@ pub struct SummaryRow {
     pub seed: u64,
 }
 
+/// 1ケース分の集計結果と占有ヒストグラム。
+///
+/// trial 詳細は完了ごとに別経路で流すため、ここには含めない。
+/// `hist_phi` は (x × φ)、`hist_y` は (x × y) の2Dヒストグラムを、x を最外として
+/// 行優先で平坦化したもの。
+#[derive(Debug)]
+pub struct CaseOutput {
+    pub summary: SummaryRow,
+    pub hist_phi: Vec<u64>,
+    pub hist_y: Vec<u64>,
+}
+
 /// 実行中に `progress.jsonl` へ書き出す進捗イベント。
 #[derive(Debug, Serialize)]
 pub struct ProgressRow {
     pub timestamp_ms: u128,
-    pub device_id: usize,
-    pub combo_id: u32,
-    pub completed_combos: usize,
-    pub total_combos: usize,
+    /// 計算している GPU の ID。CPU バックエンドでは null。
+    pub gpu_id: Option<usize>,
+    pub case_id: u32,
+    pub completed_cases: usize,
+    pub total_cases: usize,
     pub completed_trials: usize,
     pub total_trials: usize,
     pub current_steps: u64,
@@ -130,14 +145,14 @@ impl TrialResult {
     /// 内部状態コードを読みやすい文字列へ変換して CSV 行にする。
     pub fn to_csv_row(&self) -> TrialCsvRow {
         TrialCsvRow {
-            combo_id: self.combo_id,
+            case_id: self.case_id,
             trial_id: self.trial_id,
-            device_id: self.device_id,
-            m: self.params.m,
-            l: self.params.l,
-            beta_pe: self.params.beta_pe,
-            abs_delta_alpha_e_over_p: self.params.abs_delta_alpha_e_over_p,
-            f: self.params.force,
+            gpu_id: self.gpu_id,
+            m: self.case.m,
+            l: self.case.l,
+            gamma: self.case.gamma,
+            delta: self.case.delta,
+            f: self.case.f,
             x0: self.x0,
             y0: self.y0,
             phi0: self.phi0,
@@ -184,6 +199,8 @@ pub struct BoundaryCorrectedState {
     pub x: f64,
     pub y: f64,
     pub phi: f64,
+    /// 補正が行われたかの診断用フラグ（テストで境界処理の発火を検証するために残す）。
+    #[allow(dead_code)]
     pub reflected: bool,
 }
 
@@ -296,9 +313,11 @@ fn wall_foot_newton_delta(px: f64, py: f64, sign: f64, x: f64) -> f64 {
 
 /// 1周期分の上壁 y 座標を事前サンプリングする。
 ///
-/// 下壁は CUDA kernel 側で符号を反転して参照する。
-pub fn wall_y_samples() -> Vec<f64> {
-    (0..N_WALL).map(|k| omega(k as f64 * WALL_DX)).collect()
+/// 下壁は符号を反転して参照する。
+pub fn wall_y_samples(physics: &Physics) -> Vec<f64> {
+    (0..physics.n_wall)
+        .map(|k| omega(k as f64 * physics.wall_dx))
+        .collect()
 }
 
 /// 棒長から Tirado and Garcia de la Torre の補正項を計算する。
@@ -322,15 +341,18 @@ fn tirado_terms_for_length(l: f64) -> TiradoTerms {
 }
 
 /// Tirado and Garcia de la Torre の式から無次元化済み拡散係数を計算する。
-pub fn diffusion_for_length(l: f64) -> Diffusion {
+///
+/// `reference_length` は D_0 を定める基準棒長で、全ての棒長がこの共通の D_0 で
+/// 無次元化される（棒長ごとに時間スケールが変わらないようにするため）。
+pub fn diffusion_for_length(l: f64, reference_length: f64) -> Diffusion {
     let terms = tirado_terms_for_length(l);
-    let reference_terms = tirado_terms_for_length(DIFFUSION_REFERENCE_LENGTH);
-    let translational_scale = DIFFUSION_REFERENCE_LENGTH / l;
+    let reference_terms = tirado_terms_for_length(reference_length);
+    let translational_scale = reference_length / l;
 
     let d_parallel =
         4.0 * translational_scale * (terms.log_p + terms.nu_parallel) / reference_terms.denominator;
     let d_perp = 0.5 * d_parallel;
-    let d_r = 24.0 * DIFFUSION_REFERENCE_LENGTH * (terms.log_p + terms.delta_perp)
+    let d_r = 24.0 * reference_length * (terms.log_p + terms.delta_perp)
         / (l * l * l * reference_terms.denominator);
 
     Diffusion {
@@ -340,14 +362,14 @@ pub fn diffusion_for_length(l: f64) -> Diffusion {
     }
 }
 
-/// GPU から戻した初通過時間と status から、1 combo 分の summary を作る。
+/// バックエンドから戻した初通過時間と status から、1ケース分の summary を作る。
 ///
 /// `max_steps` に到達した trial は `n_max_steps` に数え、平均値の計算からは除外する。
 pub fn summarize_trials(
-    device_id: usize,
-    params: SimParams,
+    gpu_id: Option<usize>,
+    case: Case,
     n_total: usize,
-    seed: u64,
+    physics: &Physics,
     times: &[f64],
     statuses: &[i32],
     pass_directions: &[i32],
@@ -386,11 +408,7 @@ pub fn summarize_trials(
         let t2 = sum_t2 / n_ok_f;
         // μ = v/f（v = L/T1）。f=0 では移動度が定義できないので NaN を返す。
         let v = L_PERIOD / t1;
-        let mu = if params.force != 0.0 {
-            v / params.force
-        } else {
-            f64::NAN
-        };
+        let mu = if case.f != 0.0 { v / case.f } else { f64::NAN };
         let d_eff = 0.5 * L_PERIOD * L_PERIOD * (t2 - t1 * t1) / (t1 * t1 * t1);
         (t1, t2, mu, d_eff)
     } else {
@@ -398,13 +416,13 @@ pub fn summarize_trials(
     };
 
     SummaryRow {
-        combo_id: params.combo_id,
-        device_id,
-        m: params.m,
-        l: params.l,
-        beta_pe: params.beta_pe,
-        abs_delta_alpha_e_over_p: params.abs_delta_alpha_e_over_p,
-        f: params.force,
+        case_id: case.case_id,
+        gpu_id,
+        m: case.m,
+        l: case.l,
+        gamma: case.gamma,
+        delta: case.delta,
+        f: case.f,
         n_total,
         n_ok,
         n_right_passes,
@@ -415,24 +433,30 @@ pub fn summarize_trials(
         t2,
         mu,
         d_eff,
-        dt: crate::config::DT,
-        sigma: SIGMA,
-        epsilon: EPSILON,
-        seed,
+        dt: physics.delta_t,
+        sigma: physics.sigma,
+        epsilon: physics.epsilon,
+        seed: case.seed(),
     }
-}
-
-/// 仕様書から決まる静的な幾何パラメータが、実装上も一致しているか確認する。
-pub fn validate_static_geometry() -> anyhow::Result<()> {
-    anyhow::ensure!(N_WALL == 500, "expected 500 wall samples, got {N_WALL}");
-    anyhow::ensure!(WALL_K == 5, "expected wall neighbor K=5, got {WALL_K}");
-    anyhow::ensure!((particle_length(1) - 2.0 * 0.8 * SIGMA).abs() < 1e-15);
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// σ = 8e-3, Δt = 4e-7, T = 100 の標準設定に対応する Physics を返す。
+    fn test_physics() -> Physics {
+        Physics {
+            delta_t: 4.0e-7,
+            max_steps: 250_000_000,
+            sigma: 8.0e-3,
+            epsilon: 2.0,
+            wall_dx: 0.25 * 8.0e-3,
+            particle_dx: 0.8 * 8.0e-3,
+            n_wall: 500,
+            diffusion_reference_length: 6.0 * 0.8 * 8.0e-3,
+        }
+    }
 
     #[test]
     fn omega_is_periodic() {
@@ -494,13 +518,13 @@ mod tests {
         let corrected = reflect_state_into_channel(predicted_x, predicted_y, 0.0, current_x);
 
         assert!(corrected.reflected);
-        assert!(corrected.x < 0.8096408373123332);
+        assert!(corrected.x < CHANNEL_NECK_PHASE);
     }
 
     /// くびれ付近で大きく壁外に出た状態も、複数回の鏡像反射で流路内へ戻ることを確認する。
     #[test]
     fn boundary_reflection_repeats_until_state_is_inside_channel() {
-        let neck_x = 0.8096408373123332;
+        let neck_x = CHANNEL_NECK_PHASE;
         let corrected = reflect_state_into_channel(neck_x, omega(neck_x) + 0.46, 0.0, neck_x);
 
         assert!(corrected.reflected);
@@ -508,16 +532,23 @@ mod tests {
     }
 
     #[test]
-    fn wall_sampling_constants_match_spec() {
-        assert_eq!(N_WALL, 500);
-        assert_eq!(WALL_K, 5);
-        assert_eq!(wall_y_samples().len(), 500);
+    fn wall_sampling_follows_physics_geometry() {
+        let physics = test_physics();
+        let samples = wall_y_samples(&physics);
+
+        assert_eq!(samples.len(), 500);
+        assert!((samples[0] - omega(0.0)).abs() < 1e-15);
+        assert!((samples[499] - omega(499.0 * physics.wall_dx)).abs() < 1e-15);
     }
 
     #[test]
     fn diffusion_is_positive_and_finite_for_all_lengths() {
+        let physics = test_physics();
         for m in [1, 4, 8, 15, 30] {
-            let diffusion = diffusion_for_length(particle_length(m));
+            let diffusion = diffusion_for_length(
+                physics.particle_length(m),
+                physics.diffusion_reference_length,
+            );
             assert!(diffusion.d_parallel.is_finite() && diffusion.d_parallel > 0.0);
             assert!(diffusion.d_perp.is_finite() && diffusion.d_perp > 0.0);
             assert!(diffusion.d_r.is_finite() && diffusion.d_r > 0.0);
@@ -527,13 +558,14 @@ mod tests {
     /// 初通過した trial だけを平均しつつ、左右どちらへ通過したかを数えることを確認する。
     #[test]
     fn summarize_trials_counts_pass_directions() {
-        let params = SimParams {
-            combo_id: 7,
+        let physics = test_physics();
+        let case = Case {
+            case_id: 7,
             m: 3,
-            l: particle_length(3),
-            beta_pe: 0.25,
-            abs_delta_alpha_e_over_p: 0.5,
-            force: 1.0,
+            l: physics.particle_length(3),
+            gamma: 0.25,
+            delta: 0.5,
+            f: 1.0,
         };
         let times = [1.0, 2.0, 0.0];
         let statuses = [STATUS_OK, STATUS_OK, STATUS_MAX_STEPS];
@@ -543,7 +575,15 @@ mod tests {
             PASS_DIRECTION_NONE,
         ];
 
-        let summary = summarize_trials(2, params, 3, 11, &times, &statuses, &pass_directions);
+        let summary = summarize_trials(
+            Some(2),
+            case,
+            3,
+            &physics,
+            &times,
+            &statuses,
+            &pass_directions,
+        );
 
         assert_eq!(summary.n_ok, 2);
         assert_eq!(summary.n_right_passes, 1);
@@ -552,16 +592,19 @@ mod tests {
         assert!((summary.passage_fraction - 2.0 / 3.0).abs() < 1.0e-12);
         assert!((summary.t1 - 1.5).abs() < 1.0e-12);
         assert!((summary.t2 - 2.5).abs() < 1.0e-12);
+        assert_eq!(summary.seed, case.seed());
+        assert_eq!(summary.gpu_id, Some(2));
     }
 
     /// 基準長そのものでは、固定 D_0 の式が従来の同一棒長正規化と一致することを確認する。
     #[test]
     fn diffusion_at_reference_length_matches_same_length_normalization() {
-        let terms = tirado_terms_for_length(DIFFUSION_REFERENCE_LENGTH);
-        let diffusion = diffusion_for_length(DIFFUSION_REFERENCE_LENGTH);
+        let reference_length = test_physics().diffusion_reference_length;
+        let terms = tirado_terms_for_length(reference_length);
+        let diffusion = diffusion_for_length(reference_length, reference_length);
 
         let expected_parallel = 4.0 * (terms.log_p + terms.nu_parallel) / terms.denominator;
-        let expected_rotation = 24.0 / (DIFFUSION_REFERENCE_LENGTH * DIFFUSION_REFERENCE_LENGTH)
+        let expected_rotation = 24.0 / (reference_length * reference_length)
             * (terms.log_p + terms.delta_perp)
             / terms.denominator;
 
@@ -573,17 +616,17 @@ mod tests {
     /// 基準長以外の棒でも、D_0 の分母だけは共通の基準棒長から取ることを確認する。
     #[test]
     fn diffusion_uses_shared_reference_length_for_non_reference_rods() {
-        let l = particle_length(1);
+        let physics = test_physics();
+        let reference_length = physics.diffusion_reference_length;
+        let l = physics.particle_length(1);
         let terms = tirado_terms_for_length(l);
-        let reference_terms = tirado_terms_for_length(DIFFUSION_REFERENCE_LENGTH);
-        let diffusion = diffusion_for_length(l);
+        let reference_terms = tirado_terms_for_length(reference_length);
+        let diffusion = diffusion_for_length(l, reference_length);
 
-        let expected_parallel =
-            4.0 * (DIFFUSION_REFERENCE_LENGTH / l) * (terms.log_p + terms.nu_parallel)
-                / reference_terms.denominator;
-        let expected_rotation =
-            24.0 * DIFFUSION_REFERENCE_LENGTH * (terms.log_p + terms.delta_perp)
-                / (l * l * l * reference_terms.denominator);
+        let expected_parallel = 4.0 * (reference_length / l) * (terms.log_p + terms.nu_parallel)
+            / reference_terms.denominator;
+        let expected_rotation = 24.0 * reference_length * (terms.log_p + terms.delta_perp)
+            / (l * l * l * reference_terms.denominator);
 
         assert!((diffusion.d_parallel - expected_parallel).abs() < 1.0e-12);
         assert!((diffusion.d_perp - 0.5 * expected_parallel).abs() < 1.0e-12);
