@@ -329,7 +329,7 @@ fn tirado_terms_for_length(l: f64) -> TiradoTerms {
 
     let nu_parallel = -0.207 + 0.980 * inv_p - 0.133 * inv_p2;
     let nu_perp = 0.839 + 0.185 * inv_p + 0.233 * inv_p2;
-    let delta_perp = -0.630 + 0.917 * inv_p - 0.050 * inv_p2;
+    let delta_perp = -0.662 + 0.917 * inv_p - 0.050 * inv_p2;
     let denominator = 3.0 * log_p + 2.0 * nu_parallel + nu_perp;
 
     TiradoTerms {
