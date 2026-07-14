@@ -33,7 +33,7 @@
   "features": {
     "ghcr.io/devcontainers/features/common-utils:2": {
       "configureZshAsDefaultShell": "true",
-      "username": "miyake"
+      "username": "tutu"
     },
     "ghcr.io/devcontainers/features/rust:1": {
       "version": "1.96.0"
@@ -45,15 +45,17 @@
       "cudaVersion": "12.2"
     },
     "ghcr.io/devcontainers-extra/features/apt-packages:1": {
-      "packages": "build-essential, clang, mold, gnuplot, poppler-utils, ripgrep, fd-find, tmux"
+      "packages": "build-essential, clang, mold, ripgrep, fd-find, pkg-config, libssl-dev"
     }
   },
-  "runArgs": [
-    "--device=nvidia.com/gpu=all",
-    "--memory=60gb"
-  ],
-  "containerUser": "miyake",
-  "postCreateCommand": "echo 'export PATH=\"/usr/local/cuda/bin:$PATH\"' >> ~/.zshrc && echo 'export LD_LIBRARY_PATH=\"/usr/local/cuda/lib64:$LD_LIBRARY_PATH\"' >> ~/.zshrc && echo 'export PATH=\"/usr/local/cuda/bin:$PATH\"' >> ~/.bashrc && echo 'export LD_LIBRARY_PATH=\"/usr/local/cuda/lib64:$LD_LIBRARY_PATH\"' >> ~/.bashrc && cargo fetch",
+  "runArgs": ["--device=nvidia.com/gpu=all"],
+  "containerUser": "tutu",
+  "postCreateCommand": {
+    "fetch-deps": "cargo fetch",
+    "install-ax": "curl -fsSL https://ax.yusuke.run/install | sudo env AX_INSTALL_DIR=/usr/bin sh",
+    "install-ast-grep": "command -v ast-grep >/dev/null || cargo install ast-grep --locked",
+    "install-sem": "command -v sem >/dev/null || cargo install --git https://github.com/Ataraxy-Labs/sem sem-cli"
+  },
   "containerEnv": {
     "CARGO_TERM_COLOR": "always",
     "SSH_AUTH_SOCK": "/ssh-agent"

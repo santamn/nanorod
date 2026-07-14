@@ -14,21 +14,21 @@ required-features = ["gpu"]
 
 [dependencies]
 anyhow = "1.0"
-clap = { version = "4.6.1", features = ["derive"] }
-csv = "1.4.0"
-cudarc = { version = "0.19.7", default-features = false, features = [
+clap = { version = "4.6", features = ["derive"] }
+csv = "1.4"
+cudarc = { version = "0.19", default-features = false, features = [
   "std",
   "driver",
   "nvrtc",
   "dynamic-loading",
   "cuda-12020",
 ], optional = true }
-eframe = { version = "0.34.3", default-features = false, features = [
+eframe = { version = "0.35", default-features = false, features = [
   "default_fonts",
   "glow",
   "wayland",
   "x11",
 ] }
-egui = "0.34.3"
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+egui = "0.35"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
