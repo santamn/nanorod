@@ -50,6 +50,8 @@
   },
   "runArgs": ["--device=nvidia.com/gpu=all"],
   "containerUser": "tutu",
+  "remoteUser": "tutu",
+  "onCreateCommand": "sudo chown -R \"$(id -u):$(id -g)\" /usr/local/cargo/registry /usr/local/cargo/git /workspace/target",
   "postCreateCommand": {
     "fetch-deps": "cargo fetch",
     "install-ax": "curl -fsSL https://ax.yusuke.run/install | sudo env AX_INSTALL_DIR=/usr/bin sh",
