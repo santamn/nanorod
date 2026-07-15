@@ -478,7 +478,10 @@ __device__ void accumulate_histograms(
   atomicAdd(&hist_y[xb * params.hist_y_bins + yb], 1ULL);
 }
 
-// 未完了trialを固定ステップ数だけ進め、初通過またはmax_steps到達を記録する。
+// 未完了trialを固定ステップ数だけ進め、初通過（stop_on_passage != 0 のとき）
+// またはmax_steps到達を記録する。
+// stop_on_passage が 0（fixed_timeモード）の場合は通過を判定せず、
+// 全trialがmax_steps（時間T）まで走り切る。
 extern "C" __global__ void simulate_kernel(
     KernelParams params,
     unsigned char *rng_states,
@@ -499,7 +502,8 @@ extern "C" __global__ void simulate_kernel(
     int n_trials,
     unsigned int steps_per_launch,
     unsigned int hist_stride,
-    unsigned long long max_steps)
+    unsigned long long max_steps,
+    int stop_on_passage)
 {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
   if (i >= n_trials || statuses[i] != 0)
@@ -588,19 +592,23 @@ extern "C" __global__ void simulate_kernel(
     }
 
     // 補間はせず、初めて x0 ± 1 のどちらかへ到達したステップ末の状態を記録する。
-    if (xi > target_right_x[i])
+    // fixed_timeモードでは通過で打ち切らないため、判定そのものを行わない。
+    if (stop_on_passage != 0)
     {
-      status = 1;
-      pass_directions[i] = 1;
-      times[i] = ti;
-      break;
-    }
-    if (xi < target_left_x[i])
-    {
-      status = 1;
-      pass_directions[i] = -1;
-      times[i] = ti;
-      break;
+      if (xi > target_right_x[i])
+      {
+        status = 1;
+        pass_directions[i] = 1;
+        times[i] = ti;
+        break;
+      }
+      if (xi < target_left_x[i])
+      {
+        status = 1;
+        pass_directions[i] = -1;
+        times[i] = ti;
+        break;
+      }
     }
 
     // 最大ステップに到達したtrialはsummaryで別カウントにする。

@@ -82,6 +82,46 @@ pub struct TrialCsvRow {
     pub pass_direction: &'static str,
 }
 
+/// 計測モードごとに意味が異なる統計値。
+///
+/// summary.json では `"mode"` タグ（`first_passage` / `fixed_time`）付きで
+/// SummaryRow に平坦化して埋め込まれる。
+#[derive(Clone, Debug, Serialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum ModeStats {
+    /// first_passage モード: 1周期を初通過するまでの時間の統計。
+    FirstPassage {
+        /// 1周期を通過した試行数。T1・T2 の平均はこの試行だけで取る。
+        n_ok: usize,
+        n_right_passes: usize,
+        n_left_passes: usize,
+        /// 時間 T までに未通過だった試行数（平均の計算から除外）。
+        n_max_steps: usize,
+        passage_fraction: f64,
+        /// 平均初通過時間 T₁。
+        #[serde(rename = "T1")]
+        t1: f64,
+        /// 初通過時間の2乗平均 T₂。
+        #[serde(rename = "T2")]
+        t2: f64,
+    },
+    /// fixed_time モード: 時間 T まで走らせた変位 Δx = x(T) − x₀ の統計。
+    FixedTime {
+        /// 全試行を走らせた計測時間 T = max_steps × Δt。
+        #[serde(rename = "T")]
+        time: f64,
+        /// 変位の平均 ⟨Δx⟩。
+        mean_dx: f64,
+        /// 変位の分散 ⟨Δx²⟩ − ⟨Δx⟩²。
+        var_dx: f64,
+        /// 平均速度 ⟨v⟩ = ⟨Δx⟩ / T。
+        v_mean: f64,
+        /// 1周期を進む平均時間 L/|⟨v⟩|（平均初通過時間の推定）。
+        #[serde(rename = "T1")]
+        t1: f64,
+    },
+}
+
 /// 1ケース分の集計結果（summary.json の中身）。
 #[derive(Clone, Debug, Serialize)]
 pub struct SummaryRow {
@@ -94,16 +134,10 @@ pub struct SummaryRow {
     pub delta: f64,
     pub f: f64,
     pub n_total: usize,
-    pub n_ok: usize,
-    pub n_right_passes: usize,
-    pub n_left_passes: usize,
-    pub n_max_steps: usize,
-    pub passage_fraction: f64,
-    #[serde(rename = "T1")]
-    pub t1: f64,
-    #[serde(rename = "T2")]
-    pub t2: f64,
-    /// 移動度 μ = v/f（v = L/T1 は1周期あたりの平均速度）。f=0 では定義できず NaN。
+    /// 計測モードとモード固有の統計値。
+    #[serde(flatten)]
+    pub stats: ModeStats,
+    /// 非線形移動度 μ = v/f。f=0 では定義できず NaN（JSON では null）。
     pub mu: f64,
     #[serde(rename = "D_eff")]
     pub d_eff: f64,
@@ -362,10 +396,10 @@ pub fn diffusion_for_length(l: f64, reference_length: f64) -> Diffusion {
     }
 }
 
-/// バックエンドから戻した初通過時間と status から、1ケース分の summary を作る。
+/// first_passage モード: バックエンドから戻した初通過時間と status から summary を作る。
 ///
 /// `max_steps` に到達した trial は `n_max_steps` に数え、平均値の計算からは除外する。
-pub fn summarize_trials(
+pub fn summarize_first_passage(
     gpu_id: Option<usize>,
     case: Case,
     n_total: usize,
@@ -415,6 +449,75 @@ pub fn summarize_trials(
         (f64::NAN, f64::NAN, f64::NAN, f64::NAN)
     };
 
+    let stats = ModeStats::FirstPassage {
+        n_ok,
+        n_right_passes,
+        n_left_passes,
+        n_max_steps,
+        passage_fraction: n_ok as f64 / n_total as f64,
+        t1,
+        t2,
+    };
+    summary_row(gpu_id, case, n_total, physics, stats, mu, d_eff)
+}
+
+/// fixed_time モード: 時間 T まで走らせた全試行の変位 Δx = x_end − x₀ の統計から、
+/// 平均速度・非線形移動度・有効拡散係数と、1周期を進む平均時間を直接算出する。
+pub fn summarize_fixed_time(
+    gpu_id: Option<usize>,
+    case: Case,
+    n_total: usize,
+    physics: &Physics,
+    x0s: &[f64],
+    x_ends: &[f64],
+) -> SummaryRow {
+    debug_assert_eq!(x0s.len(), x_ends.len());
+
+    // 全試行が同じステップ数だけ進むため、計測時間は一律 T = max_steps × Δt。
+    let time = physics.max_steps as f64 * physics.delta_t;
+    let n = x0s.len() as f64;
+    let mut sum_dx = 0.0f64;
+    let mut sum_dx2 = 0.0f64;
+    for (&x0, &x_end) in x0s.iter().zip(x_ends) {
+        let dx = x_end - x0;
+        sum_dx += dx;
+        sum_dx2 += dx * dx;
+    }
+    let mean_dx = sum_dx / n;
+    // 分散 ⟨Δx²⟩ − ⟨Δx⟩²。丸め誤差でわずかに負へ落ちた場合は 0 に切り上げる。
+    let var_dx = (sum_dx2 / n - mean_dx * mean_dx).max(0.0);
+
+    let v_mean = mean_dx / time;
+    // μ = ⟨v⟩/f。f=0 では移動度が定義できないので NaN を返す。
+    let mu = if case.f != 0.0 {
+        v_mean / case.f
+    } else {
+        f64::NAN
+    };
+    let d_eff = var_dx / (2.0 * time);
+    // 1周期 L を平均速度で進むのにかかる時間。⟨v⟩=0 では無限大（JSON では null）。
+    let t1 = L_PERIOD / v_mean.abs();
+
+    let stats = ModeStats::FixedTime {
+        time,
+        mean_dx,
+        var_dx,
+        v_mean,
+        t1,
+    };
+    summary_row(gpu_id, case, n_total, physics, stats, mu, d_eff)
+}
+
+/// モード固有の統計値と共通のメタデータから SummaryRow を組み立てる。
+fn summary_row(
+    gpu_id: Option<usize>,
+    case: Case,
+    n_total: usize,
+    physics: &Physics,
+    stats: ModeStats,
+    mu: f64,
+    d_eff: f64,
+) -> SummaryRow {
     SummaryRow {
         case_id: case.case_id,
         gpu_id,
@@ -424,13 +527,7 @@ pub fn summarize_trials(
         delta: case.delta,
         f: case.f,
         n_total,
-        n_ok,
-        n_right_passes,
-        n_left_passes,
-        n_max_steps,
-        passage_fraction: n_ok as f64 / n_total as f64,
-        t1,
-        t2,
+        stats,
         mu,
         d_eff,
         dt: physics.delta_t,
@@ -443,11 +540,13 @@ pub fn summarize_trials(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Mode;
 
     /// σ = 8e-3, Δt = 4e-7, T = 100 の標準設定に対応する Physics を返す。
     fn test_physics() -> Physics {
         Physics {
             delta_t: 4.0e-7,
+            mode: Mode::FirstPassage,
             max_steps: 250_000_000,
             sigma: 8.0e-3,
             epsilon: 2.0,
@@ -557,7 +656,7 @@ mod tests {
 
     /// 初通過した trial だけを平均しつつ、左右どちらへ通過したかを数えることを確認する。
     #[test]
-    fn summarize_trials_counts_pass_directions() {
+    fn summarize_first_passage_counts_pass_directions() {
         let physics = test_physics();
         let case = Case {
             case_id: 7,
@@ -575,7 +674,7 @@ mod tests {
             PASS_DIRECTION_NONE,
         ];
 
-        let summary = summarize_trials(
+        let summary = summarize_first_passage(
             Some(2),
             case,
             3,
@@ -585,15 +684,96 @@ mod tests {
             &pass_directions,
         );
 
-        assert_eq!(summary.n_ok, 2);
-        assert_eq!(summary.n_right_passes, 1);
-        assert_eq!(summary.n_left_passes, 1);
-        assert_eq!(summary.n_max_steps, 1);
-        assert!((summary.passage_fraction - 2.0 / 3.0).abs() < 1.0e-12);
-        assert!((summary.t1 - 1.5).abs() < 1.0e-12);
-        assert!((summary.t2 - 2.5).abs() < 1.0e-12);
+        let ModeStats::FirstPassage {
+            n_ok,
+            n_right_passes,
+            n_left_passes,
+            n_max_steps,
+            passage_fraction,
+            t1,
+            t2,
+        } = summary.stats
+        else {
+            panic!("first_passage の統計であるべきです");
+        };
+        assert_eq!(n_ok, 2);
+        assert_eq!(n_right_passes, 1);
+        assert_eq!(n_left_passes, 1);
+        assert_eq!(n_max_steps, 1);
+        assert!((passage_fraction - 2.0 / 3.0).abs() < 1.0e-12);
+        assert!((t1 - 1.5).abs() < 1.0e-12);
+        assert!((t2 - 2.5).abs() < 1.0e-12);
         assert_eq!(summary.seed, case.seed());
         assert_eq!(summary.gpu_id, Some(2));
+    }
+
+    /// 変位の統計から μ・D_eff・1周期を進む平均時間を直接算出することを確認する。
+    #[test]
+    fn summarize_fixed_time_computes_displacement_statistics() {
+        // max_steps × Δt = 100 が計測時間 T になる。
+        let physics = Physics {
+            mode: Mode::FixedTime,
+            ..test_physics()
+        };
+        let case = Case {
+            case_id: 1,
+            m: 3,
+            l: physics.particle_length(3),
+            gamma: 0.25,
+            delta: 0.5,
+            f: 2.0,
+        };
+        // Δx = 4, 6 → ⟨Δx⟩ = 5, ⟨Δx²⟩ = 26, 分散 = 1。
+        let x0s = [0.0, 0.5];
+        let x_ends = [4.0, 6.5];
+
+        let summary = summarize_fixed_time(None, case, 2, &physics, &x0s, &x_ends);
+
+        let ModeStats::FixedTime {
+            time,
+            mean_dx,
+            var_dx,
+            v_mean,
+            t1,
+        } = summary.stats
+        else {
+            panic!("fixed_time の統計であるべきです");
+        };
+        assert!((time - 100.0).abs() < 1.0e-9);
+        assert!((mean_dx - 5.0).abs() < 1.0e-12);
+        assert!((var_dx - 1.0).abs() < 1.0e-9);
+        assert!((v_mean - 0.05).abs() < 1.0e-15);
+        // T1 = L/|⟨v⟩| = 1/0.05、μ = ⟨v⟩/f = 0.05/2、D_eff = 分散/(2T) = 1/200。
+        assert!((t1 - 20.0).abs() < 1.0e-9);
+        assert!((summary.mu - 0.025).abs() < 1.0e-15);
+        assert!((summary.d_eff - 0.005).abs() < 1.0e-12);
+        assert_eq!(summary.n_total, 2);
+    }
+
+    /// fixed_time モードで f = 0 のとき、μ は定義できず NaN になることを確認する。
+    #[test]
+    fn summarize_fixed_time_returns_nan_mu_for_zero_force() {
+        let physics = Physics {
+            mode: Mode::FixedTime,
+            ..test_physics()
+        };
+        let case = Case {
+            case_id: 0,
+            m: 1,
+            l: physics.particle_length(1),
+            gamma: 0.0,
+            delta: 0.0,
+            f: 0.0,
+        };
+        let summary = summarize_fixed_time(None, case, 2, &physics, &[0.0, 0.0], &[1.0, -1.0]);
+
+        assert!(summary.mu.is_nan());
+        // 変位が打ち消し合うと ⟨v⟩ = 0 になり、T1 は無限大（JSON では null）になる。
+        let ModeStats::FixedTime { v_mean, t1, .. } = summary.stats else {
+            panic!("fixed_time の統計であるべきです");
+        };
+        assert_eq!(v_mean, 0.0);
+        assert!(t1.is_infinite());
     }
 
     /// 基準長そのものでは、固定 D_0 の式が従来の同一棒長正規化と一致することを確認する。

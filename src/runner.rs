@@ -295,13 +295,29 @@ mod backend {
     const STEPS_PER_LAUNCH: u32 = 10_000;
     /// progress.jsonl へ進捗を書き出す最短間隔。
     const PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
-    /// GPU あたりの同時実行ケース数の既定値。
+    /// 1 GPU を飽和させるために狙う同時実行 trial 数。
     ///
-    /// A100 での実測では、同時に走る trial 数(ensemble_size × tasks_per_gpu)が
-    /// 10万程度に達するまでスループットはほぼ線形に伸びる。仕様の標準アンサンブル
-    /// (3万 trial)では 4 でほぼ飽和する。小さいアンサンブルで回すときは
-    /// config.toml の tasks_per_gpu を 32〜96 に上げるとよい。
-    const DEFAULT_TASKS_PER_GPU: usize = 4;
+    /// A100 での実測では、同時に走る trial 数(ensemble_size × 同時実行ケース数)が
+    /// 10万程度に達するまでスループットはほぼ線形に伸び、その先で飽和する。
+    /// 飽和点を確実に越えるよう、実測の飽和点の2倍を目標にする。
+    const TARGET_CONCURRENT_TRIALS: usize = 200_000;
+    /// GPU あたりの同時実行ケース数(= CUDA stream 数)の上限。
+    /// 小さいアンサンブルで stream とバッファが際限なく増えるのを防ぐ
+    /// (A100 実測ではこの規模まで改善が確認されている)。
+    const MAX_TASKS_PER_GPU: usize = 96;
+
+    /// GPU あたりの同時実行ケース数を、実測に基づいて自動調整する。
+    ///
+    /// 同時実行 trial 数(ensemble_size × ケース数)が飽和目標に達する最小の
+    /// ケース数を選ぶ。ケース総数を GPU 台数で分け合った数より多くは載せない
+    /// (余った stream は最初から遊ぶだけなので)。
+    fn auto_tasks_per_gpu(ensemble_size: usize, total_cases: usize, gpu_count: usize) -> usize {
+        let saturating_tasks = TARGET_CONCURRENT_TRIALS
+            .div_ceil(ensemble_size.max(1))
+            .min(MAX_TASKS_PER_GPU);
+        let cases_per_gpu = total_cases.div_ceil(gpu_count.max(1));
+        saturating_tasks.min(cases_per_gpu).max(1)
+    }
 
     /// GPU ごとに1本のワーカースレッドを起動し、その数を返す。
     pub fn spawn_workers(
@@ -325,10 +341,10 @@ mod backend {
             "gpu.ids に同じ GPU が複数回指定されています"
         );
 
-        let tasks_per_gpu = config.gpu.tasks_per_gpu.unwrap_or(DEFAULT_TASKS_PER_GPU);
-        ensure!(
-            tasks_per_gpu >= 1,
-            "gpu.tasks_per_gpu は1以上にしてください"
+        let tasks_per_gpu = auto_tasks_per_gpu(config.ensemble_size, total_cases, gpu_ids.len());
+        eprintln!(
+            "tasks_per_gpu={tasks_per_gpu} (ensemble_size={} とケース数 {} から自動調整)",
+            config.ensemble_size, total_cases
         );
 
         let trial_count = config.ensemble_size;
@@ -410,6 +426,25 @@ mod backend {
             status: progress.status.clone(),
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use super::auto_tasks_per_gpu;
+
+        /// アンサンブルが小さいほど同時実行ケース数を増やし、上限とケース数で頭打ちに
+        /// なることを確認する。
+        #[test]
+        fn auto_tasks_per_gpu_scales_with_ensemble_and_caps() {
+            // 標準アンサンブル(3万 trial): 20万 trial 目標 → 7 ケース同時。
+            assert_eq!(auto_tasks_per_gpu(30_000, 1000, 4), 7);
+            // 小さいアンサンブルでは stream 数の上限で頭打ち。
+            assert_eq!(auto_tasks_per_gpu(1_000, 1000, 4), 96);
+            // 1ケースで既に飽和目標を超えるなら増やさない。
+            assert_eq!(auto_tasks_per_gpu(300_000, 1000, 4), 1);
+            // ケース総数を GPU 台数で分け合った数より多くは載せない。
+            assert_eq!(auto_tasks_per_gpu(1_000, 6, 3), 2);
+        }
+    }
 }
 
 /// CPU バックエンド: GPU なしでも動作確認できるよう、rayon で trial を並列計算する。
@@ -427,9 +462,11 @@ mod backend {
 
     use super::{WorkerMessage, next_case, timestamp_ms};
     use crate::config::{
-        Case, Config, HIST_PHI_BINS, HIST_X_BINS, HIST_Y_BINS, HIST_Y_MAX, Physics,
+        Case, Config, HIST_PHI_BINS, HIST_X_BINS, HIST_Y_BINS, HIST_Y_MAX, Mode, Physics,
     };
-    use crate::model::{CaseOutput, ProgressRow, TrialResult, summarize_trials};
+    use crate::model::{
+        CaseOutput, ProgressRow, TrialResult, summarize_first_passage, summarize_fixed_time,
+    };
     use crate::simulation::run_trial;
 
     /// 1ケース分の trial 結果とヒストグラムを rayon の fold/reduce で貯める入れ物。
@@ -539,13 +576,6 @@ mod backend {
         // reduce の順序に依らず、出力を trial_id 順に揃える。
         accum.trials.sort_by_key(|trial| trial.trial_id);
 
-        let times: Vec<f64> = accum.trials.iter().map(|trial| trial.t).collect();
-        let statuses: Vec<i32> = accum.trials.iter().map(|trial| trial.status).collect();
-        let pass_directions: Vec<i32> = accum
-            .trials
-            .iter()
-            .map(|trial| trial.pass_direction)
-            .collect();
         let max_trial_steps = accum
             .trials
             .iter()
@@ -553,15 +583,32 @@ mod backend {
             .max()
             .unwrap_or(0);
 
-        let summary = summarize_trials(
-            None,
-            case,
-            trial_count,
-            &physics,
-            &times,
-            &statuses,
-            &pass_directions,
-        );
+        let summary = match physics.mode {
+            Mode::FirstPassage => {
+                let times: Vec<f64> = accum.trials.iter().map(|trial| trial.t).collect();
+                let statuses: Vec<i32> = accum.trials.iter().map(|trial| trial.status).collect();
+                let pass_directions: Vec<i32> = accum
+                    .trials
+                    .iter()
+                    .map(|trial| trial.pass_direction)
+                    .collect();
+                summarize_first_passage(
+                    None,
+                    case,
+                    trial_count,
+                    &physics,
+                    &times,
+                    &statuses,
+                    &pass_directions,
+                )
+            }
+            // fixed_time モードの統計は初期位置と終了位置の変位から取る。
+            Mode::FixedTime => {
+                let x0s: Vec<f64> = accum.trials.iter().map(|trial| trial.x0).collect();
+                let x_ends: Vec<f64> = accum.trials.iter().map(|trial| trial.x_end).collect();
+                summarize_fixed_time(None, case, trial_count, &physics, &x0s, &x_ends)
+            }
+        };
 
         CpuCaseResult {
             trials: accum.trials,

@@ -6,7 +6,7 @@
 
 use std::f64::consts::PI;
 
-use crate::config::{Case, MAX_WALL_REPULSION_FORCE, Physics, WALL_K};
+use crate::config::{Case, MAX_WALL_REPULSION_FORCE, Mode, Physics, WALL_K};
 use crate::model::{
     Diffusion, PASS_DIRECTION_LEFT, PASS_DIRECTION_NONE, PASS_DIRECTION_RIGHT, STATUS_MAX_STEPS,
     STATUS_OK, TrialResult, diffusion_for_length, omega, reflect_state_into_channel,
@@ -366,8 +366,10 @@ impl VisualSimulation {
     }
 }
 
-/// 1 trial を初通過または max_steps 到達まで実行し、確定結果を返す（CPU バックエンド用）。
+/// 1 trial を実行し、確定結果を返す（CPU バックエンド用）。
 ///
+/// first_passage モードでは初通過（または max_steps 到達）で打ち切り、
+/// fixed_time モードでは通過を計測せず max_steps（時間 T）まで走り切る。
 /// `on_step` は各 step 実行後の（ステップ数, x, y, φ）で呼ばれ、ヒストグラムの
 /// 記録などに使う。GPU カーネルと同様に、通過を判定した step も記録対象に含む。
 #[cfg_attr(feature = "gpu", allow(dead_code))] // GPU ビルドでは CPU バックエンドが無効になる
@@ -385,12 +387,14 @@ pub fn run_trial(
         delta: case.delta,
     };
     let mut sim = VisualSimulation::new(params, physics);
+    let stop_on_passage = physics.mode == Mode::FirstPassage;
 
-    while !sim.first_passed && !sim.completed {
+    while !(sim.completed || stop_on_passage && sim.first_passed) {
         sim.step();
         on_step(sim.steps, sim.x, sim.y, sim.phi);
     }
 
+    let passed = stop_on_passage && sim.first_passed;
     TrialResult {
         case_id: case.case_id,
         trial_id: 0, // 呼び出し側が採番する。
@@ -404,12 +408,13 @@ pub fn run_trial(
         phi_end: sim.phi,
         t: sim.t,
         steps: sim.steps,
-        status: if sim.first_passed {
-            STATUS_OK
+        status: if passed { STATUS_OK } else { STATUS_MAX_STEPS },
+        // fixed_time モードは通過を計測しない（GPU カーネルと出力を揃える）。
+        pass_direction: if stop_on_passage {
+            sim.pass_direction
         } else {
-            STATUS_MAX_STEPS
+            PASS_DIRECTION_NONE
         },
-        pass_direction: sim.pass_direction,
     }
 }
 
@@ -497,6 +502,7 @@ mod tests {
     fn test_physics() -> Physics {
         Physics {
             delta_t: 4.0e-7,
+            mode: Mode::FirstPassage,
             max_steps: 250_000_000,
             sigma: 8.0e-3,
             epsilon: 2.0,
@@ -693,5 +699,31 @@ mod tests {
         if trial.status == STATUS_OK {
             assert_ne!(trial.pass_direction, PASS_DIRECTION_NONE);
         }
+    }
+
+    /// fixed_time モードでは初通過があっても打ち切らず、時間 T まで走り切ることを確認する。
+    #[test]
+    fn run_trial_fixed_time_runs_to_max_steps() {
+        let physics = Physics {
+            max_steps: 20_000,
+            mode: Mode::FixedTime,
+            ..test_physics()
+        };
+        let case = Case {
+            case_id: 1,
+            m: 1,
+            l: physics.particle_length(1),
+            gamma: 0.0,
+            delta: 0.0,
+            f: 100.0,
+        };
+
+        let trial = run_trial(case, physics, 12345, |_, _, _, _| {});
+
+        assert_eq!(trial.steps, physics.max_steps);
+        assert!((trial.t - physics.max_steps as f64 * physics.delta_t).abs() < 1.0e-12);
+        assert_eq!(trial.status, STATUS_MAX_STEPS);
+        // 通過の計測はしないので、方向は常に not_passed 相当になる。
+        assert_eq!(trial.pass_direction, PASS_DIRECTION_NONE);
     }
 }

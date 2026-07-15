@@ -14,10 +14,11 @@ use cudarc::nvrtc::{CompileOptions, compile_ptx_with_opts};
 
 use crate::config::{
     BOUNDARY_REFLECTION_LIMIT, CHANNEL_NECK_PHASE, Case, HIST_PHI_BINS, HIST_X_BINS, HIST_Y_BINS,
-    HIST_Y_MAX, MAX_WALL_REPULSION_FORCE, Physics, WALL_K,
+    HIST_Y_MAX, MAX_WALL_REPULSION_FORCE, Mode, Physics, WALL_K,
 };
 use crate::model::{
-    CaseOutput, STATUS_RUNNING, TrialResult, diffusion_for_length, summarize_trials, wall_y_samples,
+    CaseOutput, STATUS_RUNNING, TrialResult, diffusion_for_length, summarize_first_passage,
+    summarize_fixed_time, wall_y_samples,
 };
 
 const KERNEL_SRC: &str = include_str!("kernels/simulation.cu");
@@ -160,6 +161,8 @@ struct KernelLaunch {
     cfg: LaunchConfig,
     rng_stride: i32,
     n_trials: i32,
+    /// first_passage モードで 1。kernel が trial を初通過で打ち切るかどうか。
+    stop_on_passage: i32,
 }
 
 /// 1つの CUDA stream が処理中のケースの進行状況。
@@ -327,6 +330,7 @@ impl StreamSlot {
             step.arg(&config.steps_per_launch);
             step.arg(&config.hist_stride);
             step.arg(&config.max_steps);
+            step.arg(&launch.stop_on_passage);
             unsafe { step.launch(launch.cfg) }?;
         }
         let job = self.job.as_mut().expect("launch_sim on idle slot");
@@ -436,6 +440,7 @@ where
         cfg: launch_config_for_trials(trial_count),
         rng_stride: i32::try_from(RNG_STATE_BYTES).expect("RNG_STATE_BYTES fits in i32"),
         n_trials: i32::try_from(trial_count).context("too many trials for i32")?,
+        stop_on_passage: (physics.mode == Mode::FirstPassage) as i32,
     };
 
     let tasks_per_gpu = config.tasks_per_gpu.max(1);
@@ -535,15 +540,30 @@ where
                     on_trials(rows);
                 }
 
-                let summary = summarize_trials(
-                    Some(config.device_id),
-                    case,
-                    trial_count,
-                    physics,
-                    &host_times,
-                    &host_statuses,
-                    &host_pass_directions,
-                );
+                let summary = match physics.mode {
+                    Mode::FirstPassage => summarize_first_passage(
+                        Some(config.device_id),
+                        case,
+                        trial_count,
+                        physics,
+                        &host_times,
+                        &host_statuses,
+                        &host_pass_directions,
+                    ),
+                    // fixed_time モードの統計は初期位置と終了位置の変位から取る。
+                    Mode::FixedTime => {
+                        let host_x0 = slot.stream.clone_dtoh(&slot.x0)?;
+                        let host_x = slot.stream.clone_dtoh(&slot.x)?;
+                        summarize_fixed_time(
+                            Some(config.device_id),
+                            case,
+                            trial_count,
+                            physics,
+                            &host_x0,
+                            &host_x,
+                        )
+                    }
+                };
                 let hist_phi = slot.stream.clone_dtoh(&slot.hist_phi)?;
                 let hist_y = slot.stream.clone_dtoh(&slot.hist_y)?;
                 on_finished(CaseOutput {

@@ -295,6 +295,8 @@ GPU 実装では、各スレッドが1つの粒子、または1つの粒子代�
 
 $y = \pm \omega(x)\ \text{where } \omega(x) = \sin(2\pi x) + 0.25\sin(4\pi x) + 1.12$ に囲まれた領域中を上の[確率微分方程式](#確率微分方程式)に従って運動する棒状粒子のシミュレーションを行い、左右どちらかへ1周期分進むまでの1次及び2次の平均初通過時間 $T_1(x_0 \to x_0 \pm L), T_2(x_0 \to x_0 \pm L)$ を数値的に求める。
 
+計測には2つのモードがあり、`config.toml` の `mode` で選択する。物理モデルは共通で、試行の打ち切り方と各量の算出方法だけが異なる。以下は既定の初通過計測（`first_passage` モード）の手順である。
+
 具体的には次の手順で行う:
 
 1. 粒子の重心の初期位置 $x_0 \in (-0.1, 0.7),\ y_0 \in (-\omega(x_0)+\frac{l}{2},\omega(x_0)-\frac{l}{2})$ と角度 $\phi_0 \in (0,2\pi)$ をランダムに決定する
@@ -306,6 +308,19 @@ $y = \pm \omega(x)\ \text{where } \omega(x) = \sin(2\pi x) + 0.25\sin(4\pi x) + 
   &\text{平均速度 } v = \frac{L}{T_1} \\
   &\text{有効拡散係数 } D_{\text{eff}} = \frac{L^2}{2}\left(\frac{T_2 - T_1^2}{T_1^3} \right)
    \end{aligned}$$
+
+### 固定時間計測（fixed_time モード）
+
+初通過で打ち切る代わりに、全試行を総シミュレーション時間 $T$ まで走らせ、各試行の変位 $\Delta x = x(T) - x_0$ の統計から次の量を直接算出するモードも選択できる。
+
+$$\begin{aligned}
+&\text{平均速度 } \langle v \rangle = \frac{\langle \Delta x \rangle}{T} \\
+&\text{非線形移動度 } \mu = \frac{\langle v \rangle}{f} \\
+&\text{有効拡散係数 } D_{\text{eff}} = \frac{\langle \Delta x^2 \rangle - \langle \Delta x \rangle^2}{2T} \\
+&\text{1周期を進む平均時間（平均初通過時間の推定）} T_1 = \frac{L}{|\langle v \rangle|}
+\end{aligned}$$
+
+このモードでは初通過の判定そのものを行わないため、通過方向の記録は残らない。
 
 シミュレーションは、以下のパラメータの組み合わせを全て試す形で行う。
 

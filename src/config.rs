@@ -37,6 +37,18 @@ fn default_hist_stride() -> u32 {
     100
 }
 
+/// 計測モード。物理モデルは両モードで共通で、試行の打ち切り方と
+/// 移動度・有効拡散係数の算出方法だけが変わる。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Mode {
+    /// 各試行を1周期の初通過で打ち切り、初通過時間の統計から μ と D_eff を求める（既定）。
+    #[default]
+    FirstPassage,
+    /// 全試行を時間 T まで走らせ、変位 Δx の統計から μ と D_eff を直接算出する。
+    FixedTime,
+}
+
 /// TOML 形式の設定ファイルに対応する構造体。
 ///
 /// `gamma`, `delta`, `f`, `m` はリストで指定し、その全組み合わせ（直積）が
@@ -46,8 +58,12 @@ fn default_hist_stride() -> u32 {
 pub struct Config {
     /// 時間刻み幅 Δt。
     pub delta_t: f64,
-    /// 1試行あたりの最大シミュレーション時間 T。未通過の試行はここで打ち切る。
+    /// 1試行あたりのシミュレーション時間 T。first_passage モードでは未通過試行の
+    /// 打ち切り時刻、fixed_time モードでは全試行に共通の計測時間になる。
     pub time: f64,
+    /// 計測モード（省略時は first_passage）。
+    #[serde(default)]
+    pub mode: Mode,
     /// 1ケースあたりの試行数（アンサンブルサイズ）。
     pub ensemble_size: usize,
     /// 全ケースの結果をまとめて出力するフォルダ。
@@ -82,9 +98,10 @@ pub struct Config {
 #[cfg_attr(not(feature = "gpu"), allow(dead_code))] // CPU ビルドでは参照されない
 pub struct GpuConfig {
     /// 使用する GPU の ID（省略時は搭載されている全 GPU）。
+    ///
+    /// GPU あたりの同時実行ケース数は ensemble_size とケース数から自動調整される
+    /// ため、設定項目はない（runner::backend::auto_tasks_per_gpu を参照）。
     pub ids: Option<Vec<usize>>,
-    /// 1つの GPU で同時に実行するケース数（省略時は 4）。
-    pub tasks_per_gpu: Option<usize>,
 }
 
 impl Config {
@@ -179,6 +196,7 @@ impl Config {
         let particle_dx = 0.8 * self.sigma;
         Ok(Physics {
             delta_t: self.delta_t,
+            mode: self.mode,
             max_steps: (self.time / self.delta_t).round() as u64,
             sigma: self.sigma,
             epsilon: self.epsilon,
@@ -241,7 +259,10 @@ impl Config {
 pub struct Physics {
     /// 時間刻み幅 Δt。
     pub delta_t: f64,
-    /// 1試行の最大ステップ数 round(time / Δt)。未通過の試行はここで打ち切る。
+    /// 計測モード。first_passage は初通過で打ち切り、fixed_time は max_steps まで走り切る。
+    pub mode: Mode,
+    /// 1試行のステップ数上限 round(time / Δt)。first_passage モードでは未通過試行の
+    /// 打ち切り、fixed_time モードでは全試行に共通の計測時間 T になる。
     pub max_steps: u64,
     /// WCA ポテンシャルの σ。
     pub sigma: f64,
@@ -428,13 +449,33 @@ m = [1, 4]
         assert_eq!(config.gamma, vec![0.25, 0.5]);
         assert!((config.delta[0] - 1.0 / 3.0).abs() < 1.0e-15);
         assert_eq!(config.hist_stride, 100);
+        assert_eq!(config.mode, Mode::FirstPassage);
         assert!(config.gpu.ids.is_none());
-        assert!(config.gpu.tasks_per_gpu.is_none());
+    }
+
+    #[test]
+    fn config_parses_fixed_time_mode() {
+        let text = format!("{}\nmode = \"fixed_time\"\n", minimal_config_text());
+        let config: Config = toml::from_str(&text).unwrap();
+        assert_eq!(config.mode, Mode::FixedTime);
+    }
+
+    #[test]
+    fn config_rejects_unknown_mode() {
+        let text = format!("{}\nmode = \"both\"\n", minimal_config_text());
+        assert!(toml::from_str::<Config>(&text).is_err());
     }
 
     #[test]
     fn config_rejects_unknown_keys() {
         let text = format!("{}\nunknown_key = 1.0\n", minimal_config_text());
+        assert!(toml::from_str::<Config>(&text).is_err());
+    }
+
+    /// tasks_per_gpu は自動調整に置き換えたため、指定されたらエラーで知らせる。
+    #[test]
+    fn config_rejects_removed_tasks_per_gpu() {
+        let text = format!("{}\n[gpu]\ntasks_per_gpu = 4\n", minimal_config_text());
         assert!(toml::from_str::<Config>(&text).is_err());
     }
 
