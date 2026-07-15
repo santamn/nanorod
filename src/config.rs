@@ -42,10 +42,10 @@ fn default_hist_stride() -> u32 {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Mode {
-    /// 各試行を1周期の初通過で打ち切り、初通過時間の統計から μ と D_eff を求める（既定）。
-    #[default]
+    /// 各試行を1周期の初通過で打ち切り、初通過時間の統計から μ と D_eff を求める。
     FirstPassage,
-    /// 全試行を時間 T まで走らせ、変位 Δx の統計から μ と D_eff を直接算出する。
+    /// 全試行を時間 T まで走らせ、変位 Δx の統計から μ と D_eff を直接算出する（既定）。
+    #[default]
     FixedTime,
 }
 
@@ -61,7 +61,7 @@ pub struct Config {
     /// 1試行あたりのシミュレーション時間 T。first_passage モードでは未通過試行の
     /// 打ち切り時刻、fixed_time モードでは全試行に共通の計測時間になる。
     pub time: f64,
-    /// 計測モード（省略時は first_passage）。
+    /// 計測モード（省略時は fixed_time）。
     #[serde(default)]
     pub mode: Mode,
     /// 1ケースあたりの試行数（アンサンブルサイズ）。
@@ -449,15 +449,15 @@ m = [1, 4]
         assert_eq!(config.gamma, vec![0.25, 0.5]);
         assert!((config.delta[0] - 1.0 / 3.0).abs() < 1.0e-15);
         assert_eq!(config.hist_stride, 100);
-        assert_eq!(config.mode, Mode::FirstPassage);
+        assert_eq!(config.mode, Mode::FixedTime);
         assert!(config.gpu.ids.is_none());
     }
 
     #[test]
-    fn config_parses_fixed_time_mode() {
-        let text = format!("{}\nmode = \"fixed_time\"\n", minimal_config_text());
+    fn config_parses_first_passage_mode() {
+        let text = format!("{}\nmode = \"first_passage\"\n", minimal_config_text());
         let config: Config = toml::from_str(&text).unwrap();
-        assert_eq!(config.mode, Mode::FixedTime);
+        assert_eq!(config.mode, Mode::FirstPassage);
     }
 
     #[test]
