@@ -4,6 +4,25 @@
 
 This nanorod is a Brownian motion simulation program implemented in Rust and CUDA.
 
+### Project Structure
+
+```
+src/
+├── main.rs           # CLI (run / animate subcommands)
+├── config.rs         # Load TOML settings and expand them into cases (Cartesian product)
+├── model.rs          # Shared physics equations and aggregation (channel geometry, boundary reflection, diffusion coefficients)
+├── simulation.rs     # CPU implementation of the physical model (used by animation and CPU backend)
+├── runner.rs         # Run all cases and write outputs (GPU/CPU backends)
+├── renderer.rs       # Animation rendering (egui/eframe)
+├── gpu.rs            # GPU backend (NVRTC and CUDA stream management)
+└── kernels/
+    └── simulation.cu # GPU implementation of the physical model (CUDA kernel)
+docs/
+├── rod_simulation.md      # Derivation and formulation of the physical model
+├── boundary_reflection.md # Mirror correction for out-of-boundary states
+└── architecture.md        # Hardware configuration of the execution machine
+```
+
 ## Physical Model of the Simulation
 
 In this nanorod project, we conduct numerical simulations of the Brownian motion of rod-shaped particles. For detailed information on the physical model, please refer to [rod_simulation.md](docs/rod_simulation.md).
